@@ -427,6 +427,7 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
   }
 }
 
+// 懒加载 symmetric kernel 系统，在 window register 或者 ncclPrepareTasks 中调用，这时已经完成了 init 过程
 ncclResult_t ncclSymkInitOnce(struct ncclComm* comm) {
   // ncclTeamLsa() below calls this internally but drops the error code so we do it here.
   NCCLCHECK(ncclDevrInitOnce(comm));

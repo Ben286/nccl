@@ -882,6 +882,7 @@ doca_error_t doca_gpu_verbs_create_qp_group_hl(struct doca_gpu_verbs_qp_init_att
     /********** Create companion QP **********/
 
     qpg_->qp_companion.gpu_dev = qp_init_attr->gpu_dev;
+    // 共享同一个 UAR 空间，两个 QP 的 sq_db 指针指向的是同一个 MMIO 地址（同一个 UAR 寄存器）
     qpg_->qp_companion.external_uar = qpg_->qp_main.external_uar;
     qpg_->qp_companion.send_dbr_mode_ext = qpg_->qp_main.send_dbr_mode_ext;
 

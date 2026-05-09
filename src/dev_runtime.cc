@@ -117,6 +117,7 @@ static int computeLsaSize(struct ncclComm* comm) {
       if (comm->rankToNode[r] == comm->rankToNode[r-1]) {
         nodeSize += 1;
       } else {
+  // 最终 lsaSize 必须是所有节点上 GPU 数量的公约数
         lsaSize = gcd(lsaSize, nodeSize);
         nodeSize = 1;
       }
@@ -144,6 +145,7 @@ ncclResult_t ncclDevrInitOnce(struct ncclComm* comm) {
   devr->lsaSelf = comm->rank % lsaSize;
   devr->lsaRankList = (int*)malloc(devr->lsaSize*sizeof(int));
   for (int i=0; i < devr->lsaSize; i++) {
+    // LSA 要求团队内的 Rank 必须是连续的
     devr->lsaRankList[i] = comm->rank + (i - devr->lsaSelf);
   }
   devr->nLsaTeams = comm->nRanks / devr->lsaSize;
@@ -155,6 +157,8 @@ ncclResult_t ncclDevrInitOnce(struct ncclComm* comm) {
   memProp.location.id = comm->cudaDev;
   CUCHECKGOTO(cuMemGetAllocationGranularity(&devr->granularity, &memProp, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED), ret, fail_lsaRankList);
 
+  // Symmetric Memory 的设计是：所有 rank 使用同一段虚拟地址。假设 rank 0 的某个 buffer 的虚拟地址是 VA，那 rank 1 也可以用同一个 VA 来访问——不同 rank 的 VA 映射到不同物理内存。
+  // 实现方式：把所有 rank 的物理页映射到一个共享 VA 空间，每个 rank 的起始偏移相差 bigSize。
   devr->bigSize = ncclParamWinStride();
   if (-devr->bigSize <= 1) {
     devr->bigSize = 1;
@@ -717,6 +721,7 @@ static ncclResult_t symWindowCreate(
   struct ncclDevrState* devr = &comm->devrState;
   struct ncclDevrWindow* win;
 
+  // 它存在于 CPU 堆内存（malloc），GPU 永远看不到它。 它是 host 侧的"完整档案"，保存了所有 teardown、注销、barrier 时需要的信息。
   win = (struct ncclDevrWindow*)malloc(sizeof(struct ncclDevrWindow));
   memset(win, 0, sizeof(*win));
   win->memory = mem;
@@ -732,9 +737,11 @@ static ncclResult_t symWindowCreate(
     win->userPtr = userPtr;
   }
 
+  // 它存在于 GPU 显存中（由 ncclShadowPool 在 GPU 上分配）。 GPU kernel 通过 ncclWindow_t（即 ncclWindow_vidmem*）指针直接读取这些字段，完成 symmetric 寻址
   struct ncclWindow_vidmem* winDev;
   struct ncclWindow_vidmem* winDevHost;
   NCCLCHECK(ncclShadowPoolAlloc(&devr->shadows, &winDev, &winDevHost, stream));
+  // 两者通过互指的指针（win->vidmem 和 winDevHost->winHost）绑定在一起
   win->vidmem = winDev;
   winDevHost->lsaFlatBase = (char*)devr->lsaFlatBase + win->bigOffset;
   winDevHost->mcOffset4K = win->bigOffset>>12;
@@ -751,21 +758,28 @@ static ncclResult_t symWindowCreate(
   NCCLCHECK(symWindowTableInitOnce(comm, stream)); // ensure devr->windowTable exists
   struct ncclDevCommWindowTable* tableDev = devr->windowTable;
   while (true) {
+    // ① 拿到当前节点的 CPU 镜像
     struct ncclDevCommWindowTable* tableHost;
     NCCLCHECK(ncclShadowPoolToHost(&devr->shadows, tableDev, &tableHost));
+    // ② 线性扫描找第一个空 entry（window == nullptr）
     int i = 0;
     while (i < 32 && tableHost->entries[i].window != nullptr) i += 1;
     if (i < 32) {
+      // ③ 找到空位，写 CPU 镜像
       tableHost->entries[i].base = userAddr;
       tableHost->entries[i].size = userSize;
       tableHost->entries[i].window = winDev;
+      // ④ 只把这一个 entry H2D 拷贝（不需要同步整个节点）
       CUDACHECK(cudaMemcpyAsync(&tableDev->entries[i], &tableHost->entries[i], sizeof(tableHost->entries[i]), cudaMemcpyHostToDevice, stream));
       break;
     }
     if (tableHost->next == nullptr) {
+      // 分配新节点（GPU 显存 + CPU 镜像）
       NCCLCHECK(ncclShadowPoolAlloc<ncclDevCommWindowTable>(&devr->shadows, &tableHost->next, nullptr, stream));
+      // 把新节点的 GPU 地址写入当前节点的 next 字段（GPU 端可见）
       CUDACHECK(cudaMemcpyAsync(&tableDev->next, &tableHost->next, sizeof(tableHost->next), cudaMemcpyHostToDevice, stream));
     }
+    // 移动到新节点（GPU 侧指针）继续循环
     tableDev = tableHost->next;
   }
 
@@ -829,6 +843,7 @@ fail:
   return ret;
 }
 
+// 把 userPtr ~ userPtr+userSize 这段用户 GPU 内存包装成一个 NCCL window，使其能够被 NCCL Device API / LSA / GIN 访问，并把这个 window 挂到 NCCL 的 host/device 管理结构里。
 ncclResult_t ncclDevrWindowRegisterInGroup(
     struct ncclComm* comm,
     void* userPtr, size_t userSize, int winFlags, ncclWindow_t* outWinDev
@@ -846,10 +861,16 @@ ncclResult_t ncclDevrWindowRegisterInGroup(
   size_t offset = 0;
   bool hasSysmemSegment = false;
 
+  // communicator 级的本地注册
+  // 1. 地址按页对齐
+  // 2. 查 regCache 是否已有覆盖项
+  // 3. 若无则创建注册项
+  // 4. 维护引用计数
   NCCLCHECKGOTO(ncclCommRegister(comm, userPtr, userSize, &localRegHandle), ret, fail);
 
   if (winFlags & NCCL_WIN_COLL_SYMMETRIC) {
     // Defer symmetric kernel init until at least one window with that flag exists.
+    // 懒初始化 symmetric kernel 系统
     NCCLCHECKGOTO(ncclSymkInitOnce(comm), ret, fail_locReg);
   }
 
@@ -897,6 +918,11 @@ ncclResult_t ncclDevrWindowRegisterInGroup(
 
   CUDACHECKGOTO(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), ret, fail_locReg_memHandle_mem);
 
+  // 基于上面已经准备好的对称内存（mem），创建一个 NCCL “window” 对象，并同时把这个 window 注册到：
+  // 1. 主机侧控制结构
+  // 2. 设备侧可访问的 window 描述符
+  // 3. 设备侧 window 查找表（windowTable）
+  // 4. 主机侧按地址排序的查找数组 winSorted[]
   NCCLCHECKGOTO(symWindowCreate(
       comm, mem, memOffset, userPtr, userSize, winFlags, localRegHandle, outWinDev, &winHost, stream
     ), ret, fail_locReg_memHandle_mem_stream);
@@ -907,6 +933,8 @@ ncclResult_t ncclDevrWindowRegisterInGroup(
   // symWindowCreate needs barrier.
   NCCLCHECKGOTO(bootstrapBarrier(comm->bootstrap, comm->rank, comm->nRanks, 0xbeef), ret, fail_locReg_memHandle_mem_stream_win);
 
+  // 把 window 放进一个全局 host 侧地址映射表 ncclWindowMap 中
+  // 当后续 API 拿到一个 ncclWindow_t（设备 window 句柄）时，可以快速在 host 侧找到它对应的 ncclDevrWindow*
   {
     std::lock_guard<std::mutex> lock(ncclWindowMapMutex);
     // Set intrusive map fields directly on winHost
@@ -1496,6 +1524,7 @@ ncclResult_t ncclDevCommCreate(
 
   NCCLCHECKGOTO(ncclCalloc(&task, 1), ret, fail);
   // reqs must be deep copied to the task so background threads can safely access it
+  // 用户传入的 reqs 是栈上对象，而 task 会在后台线程中执行（异步）。深拷贝保证 reqs 中的链表即使用户的栈帧已销毁也能安全访问
   NCCLCHECKGOTO(deepCopyDevCommRequirements(reqs, &task->reqs), ret, fail);
   if (devCompat->devCommRequirementsFilter) {
     NCCLCHECKGOTO(devCompat->devCommRequirementsFilter(comm, task->reqs), ret, fail);

@@ -423,8 +423,9 @@ struct doca_gpunetio_ib_mlx5_wqe_data_seg {
     __be64 addr;
 } __attribute__((__packed__));
 
+// ctrl seg 总共 16 bytes
 struct doca_gpunetio_ib_mlx5_wqe_ctrl_seg {
-    __be32 opmod_idx_opcode; /**< opcode + wqe idx */
+    __be32 opmod_idx_opcode; /**< opcode + wqe idx, 32 bit */
     __be32 qpn_ds;           /**< qp number */
     union {
         struct {

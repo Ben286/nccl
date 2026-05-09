@@ -171,13 +171,44 @@ __device__ static __forceinline__ int doca_gpu_dev_verbs_poll_one_cq_at(
     return status;
 }
 
-/**
- * @brief [Internal] Poll the Completion Queue (CQ) at a specific index.
- * This function does not update the SW consumer index nor guarantees the ordering.
- *
- * @param qp - Queue Pair (QP)
- * @param cons_index - Index of the Completion Queue (CQ) to be polled
- */
+// ════════════════════════════════════════════════════════════════════════════
+// doca_priv_gpu_dev_verbs_poll_cq_at（阻塞版 - 内部实现）
+// ════════════════════════════════════════════════════════════════════════════
+// 自旋等待 CQ 中第 cons_index 号 CQE 到达。这是 wait_until_slot_available
+// 的核心引擎——通过检测 CQE 来确认 NIC 已完成对应 WQE。
+//
+// ★ CQ 环形缓冲区布局：
+//   cqe_daddr ──▶ ┌─────────┐ CQE[0]  (64 bytes)
+//                  ├─────────┤ CQE[1]
+//                  │  ...    │
+//                  ├─────────┤ CQE[cqe_num-1]
+//                  └─────────┘
+//   NIC 按顺序向 CQ 写入 CQE，每写一个就翻转该槽位的 ownership bit。
+//
+// ★ 算法：
+//   1. 计算 CQE 在环形缓冲区中的物理位置：
+//      cons_index_in_cq = cons_index + cqe_rsvd（初始偏移量）
+//      idx = cons_index_in_cq & (cqe_num - 1)（取模）
+//
+//   2. 快速路径检测：如果 cons_index < cqe_ci（已被其他线程消费），直接返回成功
+//
+//   3. 自旋检测 CQE 到达（do-while 循环）：
+//      - 读取 CQE 的 op_own 字段（NIC DMA 写入 GPU 显存）
+//      - 检查 ownership bit 翻转：
+//        (opown & OWNER_MASK) ^ !!(cons_index_in_cq & cqe_num)
+//        CQ 每绕一圈，ownership 期望值翻转一次。
+//        如果实际 ownership == 期望值 → NIC 已写入该 CQE
+//      - 在旧架构上还检查 wqe_counter 字段是否匹配 cons_index
+//        （确认不是旧 CQE 的残留数据）
+//
+//   4. 检测到 CQE 后检查 opcode：
+//      如果是 CQE_REQ_ERR → 返回 -EIO（WQE 执行出错）
+//      否则返回 0（成功）
+//
+// ★ 为什么用 load_relaxed_sys_global 读 CQE？
+//   CQE 是 NIC 通过 PCIe DMA 写入 GPU 显存的，必须用 .sys 作用域
+//   才能看到跨设备（NIC→GPU）的最新写入。
+// ════════════════════════════════════════════════════════════════════════════
 template <enum doca_gpu_dev_verbs_resource_sharing_mode resource_sharing_mode =
               DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
           enum doca_gpu_dev_verbs_qp_type qp_type = DOCA_GPUNETIO_VERBS_QP_SQ>
@@ -226,15 +257,20 @@ __device__ static __forceinline__ int doca_priv_gpu_dev_verbs_poll_cq_at(
     return (opcode == DOCA_GPUNETIO_IB_MLX5_CQE_REQ_ERR) * -EIO;
 }
 
-/**
- * @brief Poll the Completion Queue (CQ) at a specific index. This function waits for the completion
- * to arrive.
- *
- * @param qp - Queue Pair (QP)
- * @param cons_index - Index of the Completion Queue (CQ) to be polled
- * @return On success, doca_gpu_dev_verbs_poll_cq_at() returns 0. If it is a completion with
- * error, returns a negative value.
- */
+// ════════════════════════════════════════════════════════════════════════════
+// doca_gpu_dev_verbs_poll_cq_at（阻塞版 - 公开接口）
+// ════════════════════════════════════════════════════════════════════════════
+// 等待第 cons_index 号 CQE 到达，成功后：
+//   1. fence.acquire.sys → 确保后续读取能看到 NIC DMA 写入的数据
+//   2. atomic_max(cqe_ci, cons_index + 1) → 推进 CQ 软件消费索引
+//      使用 atomic_max 是因为多线程可能并发 poll 不同 CQE，
+//      只需保证 cqe_ci 单调递增（不回退）
+//
+// 被 wait_until_slot_available 调用：
+//   poll_cq_at(&qp->cq_sq, wqe_idx - nwqes)
+//   → 等待第 (wqe_idx - nwqes) 号 WQE 的 CQE 到达
+//   → 确认该 WQE 已完成 → 对应物理槽位可以重用
+// ════════════════════════════════════════════════════════════════════════════
 template <enum doca_gpu_dev_verbs_resource_sharing_mode resource_sharing_mode =
               DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
           enum doca_gpu_dev_verbs_qp_type qp_type = DOCA_GPUNETIO_VERBS_QP_SQ>

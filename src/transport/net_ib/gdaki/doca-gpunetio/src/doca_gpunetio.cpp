@@ -979,53 +979,104 @@ doca_error_t doca_gpu_verbs_unexport_multi_qps_dev(struct doca_gpu *gpu_dev,
     return status;
 }
 
+// ---------------------------------------------------------------------------
+// priv_cpu_proxy_progress_full_assisted：完整 CPU 代劳模式
+// ---------------------------------------------------------------------------
+// 场景：GPU 完全无法访问 NIC UAR，所有 Doorbell 都由 CPU 代敲。
+//
+// 工作流程：
+//   1. 原子读取 cpu_db（GPU 写入的最新 Producer Index）
+//   2. 与 sq_wqe_pi_last 比较，相等则无新 WQE，直接返回
+//   3. 构造 ctrl_seg：
+//      - opmod_idx_opcode = htobe32(PI << 8) —— PI 编码在高 24 bit
+//      - qpn_ds = QPN << 8 的大端值
+//   4. 如果非 NO_DBR_HW 模式（需要写 DBR）：
+//      a. 先敲一次 DB（sq_db）—— 尽快通知 NIC
+//      b. 写 DBR（sq_dbrec）—— NIC 恢复时的回退读取源
+//      c. release fence —— 确保 DBR 对 NIC 可见
+//   5. 再敲一次 DB（无论是否有 DBR）—— NIC 恢复后会先读 DBR，然后需要这次 DB 触发重新处理
+//   6. 更新 sq_wqe_pi_last
+//
+// Doorbell 写入格式：
+//   向 sq_db（UAR MMIO）写入 8 字节的 ctrl_seg：
+//     [31:8] = PI,  [7:0] = 0        （opmod_idx_opcode）
+//     [31:8] = QPN, [7:0] = ds_count  （qpn_ds）
+//   NIC 读取后知道“QP #QPN 的 SQ 有新 WQE，从 PI 开始处理”
 static inline void priv_cpu_proxy_progress_full_assisted(struct doca_gpu_verbs_qp *qp,
                                                          bool *out_progressed) {
     uint32_t tmp_db = 0;
     __be32 dbr_val;
     bool progressed = false;
 
+    // 步骤 1：原子读取 GPU 写入的最新 Producer Index
     tmp_db = (uint32_t)(reinterpret_cast<std::atomic<uint64_t> *>(qp->cpu_db)
                             ->load(std::memory_order_relaxed));
+    // 步骤 2：检测是否有新 WQE
     if (tmp_db != qp->sq_wqe_pi_last) {
+        // 步骤 3：构造简化的 WQE ctrl segment（只需 opcode+PI 和 QPN+ds）
         struct doca_gpunetio_ib_mlx5_wqe_ctrl_seg ctrl_seg = {
             .opmod_idx_opcode = htobe32(tmp_db << 8), .qpn_ds = qp->sq_num_shift8_be};
 
+        // 步骤 4：如果硬件需要 DBR，先敲 DB 再写 DBR 再敲 DB
         if (qp->send_dbr_mode_ext != DOCA_GPUNETIO_VERBS_SEND_DBR_MODE_EXT_NO_DBR_HW) {
             dbr_val = htobe32(tmp_db & 0xffff);
 
-            // Ring the DB ASAP.
+            // 第一次敲 DB：尽快通知 NIC 有新 WQE
             // The second DB ringing happens after the fence. This is used when the NIC enters a
             // recovery state and it needs to read DBR.
             reinterpret_cast<std::atomic<uint64_t> *>(qp->sq_db)->store(
                 *reinterpret_cast<uint64_t *>(&ctrl_seg), std::memory_order_relaxed);
+            // 写 DBR：NIC 恢复时的回退读取源
             reinterpret_cast<std::atomic<uint32_t> *>(qp->sq_dbrec)
                 ->store(dbr_val, std::memory_order_relaxed);
+            // release fence：确保 NIC 在读 DBR 时能看到正确值
             std::atomic_thread_fence(std::memory_order_release);
         }
+        // 步骤 5：（再次）敲 DB，确保 NIC 在恢复状态下也能处理
         reinterpret_cast<std::atomic<uint64_t> *>(qp->sq_db)->store(
             *reinterpret_cast<uint64_t *>(&ctrl_seg), std::memory_order_relaxed);
 
+        // 步骤 6：更新跟踪值
         qp->sq_wqe_pi_last = tmp_db;
         progressed = true;
     }
     *out_progressed = progressed;
 }
 
+// ---------------------------------------------------------------------------
+// priv_cpu_proxy_progress_dbr_assisted：软件模拟 DBR 模式
+// ---------------------------------------------------------------------------
+// 场景：GPU 能直接敲 Doorbell（已导出 UAR），但硬件不支持 DBR。
+//       GPU 只负责写 WQE + 更新 sq_wqe_pi（但不写 DBR）。
+//       CPU proxy 通过 GDRCopy 读取 GPU 显存中的 sq_wqe_pi，
+//       然后代写 DBR + 敲 DB。
+//
+// 与 full_assisted 的区别：
+//   - cpu_db 指向 qp_gpu_h->sq_wqe_pi（GDRCopy 映射），而非独立分配的共享内存
+//   - GPU 已经自己敲过 DB，CPU 这里是补写 DBR + 再敲一次 DB
+//   - 不返回 progressed 标志（因为这种模式下 GPU 已完成主要工作）
+//
+// 写入顺序：DBR → fence → DB
+//   必须先写 DBR 再敲 DB，因为 NIC 收到 DB 后可能立即读 DBR
+//   如果 DBR 还没写好，NIC 会读到过期值
 static inline void priv_cpu_proxy_progress_dbr_assisted(struct doca_gpu_verbs_qp *qp) {
     uint32_t tmp_db = 0;
     __be32 dbr_val;
 
+    // 通过 GDRCopy 原子读取 GPU 显存中的 sq_wqe_pi
     tmp_db = (uint32_t)(reinterpret_cast<std::atomic<uint64_t> *>(qp->cpu_db)
                             ->load(std::memory_order_relaxed));
     if (tmp_db != qp->sq_wqe_pi_last) {
         struct doca_gpunetio_ib_mlx5_wqe_ctrl_seg ctrl_seg = {
             .opmod_idx_opcode = htobe32(tmp_db << 8), .qpn_ds = qp->sq_num_shift8_be};
 
+        // 先写 DBR（NIC 恢复时的回退读取源）
         dbr_val = htobe32(tmp_db & 0xffff);
         reinterpret_cast<std::atomic<uint32_t> *>(qp->sq_dbrec)
             ->store(dbr_val, std::memory_order_relaxed);
+        // release fence：确保 NIC 读 DBR 时能看到正确值
         std::atomic_thread_fence(std::memory_order_release);
+        // 再敲 DB：通知 NIC 有新 WQE
         reinterpret_cast<std::atomic<uint64_t> *>(qp->sq_db)->store(
             *reinterpret_cast<uint64_t *>(&ctrl_seg), std::memory_order_relaxed);
 
@@ -1033,6 +1084,16 @@ static inline void priv_cpu_proxy_progress_dbr_assisted(struct doca_gpu_verbs_qp
     }
 }
 
+// ---------------------------------------------------------------------------
+// doca_gpu_verbs_cpu_proxy_progress：CPU proxy 的统一入口
+// ---------------------------------------------------------------------------
+// 根据 QP 的 send_dbr_mode_ext 和 nic_handler 选择两条路径：
+//
+//   条件：NO_DBR_SW_EMULATED && nic_handler != CPU_PROXY
+//   → dbr_assisted：GPU 已自己敲过 DB，CPU 只需补写 DBR + 再敲一次 DB
+//
+//   其他情况（包括 nic_handler == CPU_PROXY）
+//   → full_assisted：GPU 完全不敲 DB，CPU 负责全部 Doorbell 操作
 doca_error_t doca_gpu_verbs_cpu_proxy_progress(struct doca_gpu_verbs_qp *qp, bool *out_progressed) {
     bool progressed = false;
     if (qp == nullptr) return DOCA_ERROR_INVALID_VALUE;
@@ -1041,8 +1102,10 @@ doca_error_t doca_gpu_verbs_cpu_proxy_progress(struct doca_gpu_verbs_qp *qp, boo
 
     if ((qp->send_dbr_mode_ext == DOCA_GPUNETIO_VERBS_SEND_DBR_MODE_EXT_NO_DBR_SW_EMULATED) &&
         (qp->qp_cpu->nic_handler != DOCA_GPUNETIO_VERBS_NIC_HANDLER_CPU_PROXY)) {
+        // DBR 辅助路径：GPU 已敲 DB，CPU 补写 DBR
         priv_cpu_proxy_progress_dbr_assisted(qp);
     } else {
+        // 完整代劳路径：CPU 负责所有 Doorbell 操作
         priv_cpu_proxy_progress_full_assisted(qp, &progressed);
     }
 

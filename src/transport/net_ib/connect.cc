@@ -655,6 +655,7 @@ ncclResult_t ncclIbConnect(void* ctx, int dev, void* opaqueHandle, void** sendCo
   uint8_t link_layer = IBV_LINK_LAYER_UNSPECIFIED;
   *sendComm = NULL;
 
+  // 每次调用进来，先检查上次停在哪个阶段，跳转过去继续
   if (stage->state == ncclIbCommStateConnect)      goto ib_connect_check;
   if (stage->state == ncclIbCommStateSendDevList)  goto ib_send_dev_list;
   if (stage->state == ncclIbCommStateRecvDevList)  goto ib_recv_dev_list;

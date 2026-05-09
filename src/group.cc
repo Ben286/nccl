@@ -255,6 +255,7 @@ ncclResult_t ncclCommGroupRegisterSymmetric(struct ncclAsyncJob* job_) {
 
   CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), ret, fail);
 
+  // 处理 Window 注册任务（ncclWindowCreate 提交的）
   while (!ncclIntruQueueEmpty(&comm->devrState.regTaskQueue)) {
     struct ncclDevrRegTask* task = ncclIntruQueueDequeue(&comm->devrState.regTaskQueue);
     NCCLCHECKGOTO(ncclDevrWindowRegisterInGroup(
@@ -263,6 +264,7 @@ ncclResult_t ncclCommGroupRegisterSymmetric(struct ncclAsyncJob* job_) {
     free(task);
   }
 
+  // 处理 DevComm 创建任务（ncclDevCommCreate 提交的）
   while (!ncclIntruQueueEmpty(&comm->devrState.commCreateTaskQueue)) {
     struct ncclDevrCommCreateTask* task = ncclIntruQueueDequeue(&comm->devrState.commCreateTaskQueue);
     NCCLCHECKGOTO(ncclDevrCommCreateInternal(
@@ -272,12 +274,14 @@ ncclResult_t ncclCommGroupRegisterSymmetric(struct ncclAsyncJob* job_) {
     free(task);
   }
 
+  // 处理 CE 初始化任务（ncclCeInit 提交的）
   while (!ncclIntruQueueEmpty(&comm->ceInitTaskQueue)) {
     struct ncclCeInitTask* task = ncclIntruQueueDequeue(&comm->ceInitTaskQueue);
     NCCLCHECKGOTO(ncclCeInit(task->comm), ret, fail);
     free(task);
   }
 
+  // 处理 RMA CE 初始化任务（ncclRmaCeInit 提交的）
   while (!ncclIntruQueueEmpty(&comm->rmaCeInitTaskQueue)) {
     struct ncclRmaCeInitTask* task = ncclIntruQueueDequeue(&comm->rmaCeInitTaskQueue);
     NCCLCHECKGOTO(ncclRmaCeInit(task->comm), ret, fail);

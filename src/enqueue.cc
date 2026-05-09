@@ -5,6 +5,96 @@
  * See LICENSE.txt for more license information
  *************************************************************************/
 
+
+// ============================================================================
+// enqueue.cc — NCCL collective 入队/调度/发射流程
+// ============================================================================
+// 这是 NCCL 最核心的“中间层”：负责将用户提交的 ncclAllReduce/AllGather 等操作
+// 转化为 GPU kernel 发射和 proxy 操作。
+//
+// ===== 触发机制：ncclGroupEnd 如何驱动整个流程 =====
+//
+//  用户调用 ncclGroupStart() ... ncclAllReduce/Send/Recv ... ncclGroupEnd()
+//  ncclGroupEnd() 内部通过异步 job 机制（group.cc）驱动：
+//    1. ncclPrepareTasksAndCollPreconnectFunc（异步 job）
+//       → 调用 ncclPrepareTasks()：分析所有任务，选 algo/proto，symk 分流
+//       → 如果需要 runtimeConn，还会调用 ncclCollPreconnect() 建立传输连接
+//    2. ncclLaunchPrepare()：将任务打包成 plan（每个 plan = 一次 kernel launch）
+//    3. ncclLaunchKernelBefore → ncclLaunchKernel → ncclLaunchKernelAfter
+//    4. ncclLaunchFinish()：流同步 + 资源回收
+//
+// ===== 整体流程：一次 ncclGroup 内的调用 =====
+//
+//  [API 入口] ncclAllReduce / ncclAllGather / ncclSend / ncclRecv 等
+//      ↓
+//  ncclEnqueueCheck（入口函数，行 2979）
+//    - 参数检查（内存对齐、类型匹配等）
+//    - 将任务封装为 ncclTaskColl / ncclTaskP2p，加入 planner 队列
+//    - 每个 ncclTaskColl 记录 sendbuff/recvbuff/count/datatype/op 等用户参数
+//      ↓
+//  ncclGroupEnd 触发 ncclPrepareTasks（行 457）
+//    - 先尝试 ncclMakeSymmetricTaskList：将能用 symk 的任务分流到 collSymTaskQueue
+//    - 剩余任务按 (func, op, datatype) 分组，调 ncclGetAlgoInfo 选 algo/proto
+//    - algo 选项：Ring / Tree / NVLS / NVLS_TREE / CollNet_Chain / CollNet_Direct
+//    - proto 选项：LL（Low Latency）/ LL128 / Simple
+//    - 为 NVLS 算法的任务做 buffer 注册（ncclRegisterCollNvlsBuffers）
+//    - 结果：collTaskQueue（传统 collective）、collSymTaskQueue（symmetric）、
+//            collCeTaskQueue（CE copy）、rmaTaskQueue（RMA 单边传输）
+//      ↓
+//  ncclLaunchPrepare（行 1608） — 将任务分装入 plan
+//    - 每个 plan 对应一次 kernel launch
+//    - plan 构建优先级：RMA > CE > Sym > Traditional Colls > P2P
+//    - 对于 Sym plan：调用 ncclSymmetricTaskScheduler，选择 symk kernel，
+//      参数通过 ncclSymkDevWorkArgs 传入，不需要 workFifo
+//    - 对于传统 plan：scheduleCollTasksToPlan 分配 channel + chunk，
+//      为每个 channel 构建 ncclDevWorkBatch + ncclProxyOp
+//    - finishPlan：确定 work 存在哪里（Args 内联 vs Fifo vs Persistent）
+//      ↓
+//  ncclLaunchKernelBefore_NoUncapturedCuda（行 1765）
+//    - uploadWork：如果是 Fifo 模式，将 devWork 写入 workFifo ring buffer
+//    - symk/CE/RMA 的 plan 直接跳过（它们的参数内嵌在 kernelArgs 中）
+//      ↓
+//  ncclLaunchKernel（行 1796） - 实际发射 GPU kernel
+//    - 处理 CGA cluster（sm90+）、MemSyncDomain、LaunchCompletionEvent 等
+//    - cuLaunchKernelEx（CUDA 11.8+）或普通 cuLaunchKernel
+//    - grid = {nChannels, 1, 1}：每个 channel 一个 thread block
+//    - symk 和传统 kernel 共用同一套发射路径，区别仅在 smem 和 kernel function
+//      ↓
+//  ncclLaunchKernelAfter_NoCuda（行 1900）
+//    - hostStreamPlanTask：将 proxy op 提交给 proxy 线程
+//    - 非 persistent 模式下将 plan 送入 callbackQueue 等待回收
+//      ↓
+//  ncclLaunchFinish（行 1940）
+//    - 设置流同步事件，确保所有 user stream 看到 kernel 完成
+//    - 为 workFifo 记录回收事件（KernelFinishCallback 异步更新 workFifoConsumed）
+//
+// ===== WorkFifo vs WorkArgs vs WorkPersistent =====
+//   ncclDevWorkStorageTypeFifo：最传统的方式
+//     host 将 ncclDevWorkColl 结构写入 ring buffer（workFifo）
+//     kernel 启动后巡检 workFifo 获取工作描述符
+//     适合：大量任务，节省 host 内存
+//     回收：GPU 完成后通过 KernelFinishCallback 异步推进 workFifoConsumed
+//   ncclDevWorkStorageTypeArgs：内联到 kernel launch args
+//     小任务可以直接把 work struct 内嵌到 cuLaunchKernelEx 的 args 中
+//     分配在 memScoped，常见于 4 个以内小任务
+//     finishPlan() 中的判断条件：sizeof(ncclDevKernelArgs) + batchBytes + workBytes <= workArgsBytes
+//   ncclDevWorkStorageTypePersistent：持久内存（CUDA Graphs 场景）
+//     CUDA Graph capture 时，workFifo 不可用，必须用 persistent 内存
+//     通过 cudaMallocAsync 分配设备内存，cudaMemcpyAsync 上传
+//
+// ===== 新增特性：Symmetric Collective Task（Symmetric kernel 模式）=====
+//   ncclPrepareTasks 中会先调 ncclMakeSymmetricTaskList 筛选可用 Symmetric 算法的任务
+//   Symmetric 任务不经过普通 channel/ring 调度，而是直接发射 ncclSymkKernel
+//   此类 kernel 对 warp 分配策略要求不同，用 ncclDevWorkArgs 外的独立内存分配
+//
+// ===== 新增特性：CE（Copy Engine）Collective =====
+//   collCeTaskQueue：小数据量的 AllGather/Reduce，用 cudaMemcpy 实现
+//   附带 NVLS 同步（CE 不能直接操作 NVLS multicast）
+//
+// ===== 新增特性：RMA（Remote Memory Access）=====
+//   rmaTaskQueue： ncclPut/ncclGet 不通过 collective channel，
+//   而是选择一个最优传输路径来执行单边传输
+// ============================================================================
 #include "enqueue.h"
 #include "argcheck.h"
 #include "coll_net.h"
@@ -30,21 +120,49 @@ NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
 NCCL_PARAM(AllgathervEnable, "ALLGATHERV_ENABLE", 1);
 NCCL_PARAM(SymCeThreshold, "SYM_CE_THRESHOLD", 8*1024*1024);
 
-// Returns maximum kernel stack size of all CUDA kernels
+// ncclInitKernelsForDevice：为当前 GPU 初始化所有 NCCL kernel 的属性
+// ============================================================================
+// 对两类 kernel 分别处理：
+//   sym=0：普通 NCCL kernel（ncclDevKernelList）
+//     - 包含所有 func x algo x proto 组合的 kernel function pointer
+//     - 例如 AllReduce_Ring_Simple、AllGather_NVLS_LL128 等
+//   sym=1：Symmetric kernel（ncclSymkKernelList）
+//     - 18 种 kernel（AllGather 7 种、AllReduce 5 种、ReduceScatter 6 种）
+//     - 每种 kernel 有独立的 smem 需求
+// 对每个 kernel：
+//   1. 检查是否需要更高版本驱动（krequires[k]），如果不满足则 nullify
+//      这是因为某些 kernel 使用了新 PTX 指令（如 TMA），需要新驱动支持
+//   2. 读取 cudaFuncAttributes（stack size、smem size）
+//   3. 如果用户设置了 NCCL_L1_SHARED_MEMORY_CARVEOUT，应用 carveout
+//      carveout 控制 L1 cache 和 shared memory 的比例
+//   4. 设置 maxDynamicSharedMemorySize（允许 kernel 使用最大动态共享内存）
+//      Symmetric kernel 单独记录到 ncclSymkKernelMaxDynamicSmem[k]
+//        因为每个 symk kernel 的 smem 需求不同
+//      普通 kernel 取所有 kernel 中的最小值（maxDynamicSmem）
+//        因为普通 kernel 共用一个发射函数，发射时无法区分
+// 最终校验：
+//   ncclShmemDynamicSize(cudaArch) 必须 <= maxDynamicSmem，否则报错
+//   这保证所有普通 kernel 都能获得足够的动态共享内存
+// ============================================================================
 ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* maxStackSize) {
   ncclResult_t result = ncclSuccess;
 
   if (maxStackSize) *maxStackSize = 0;
   int carveout = ncclParamL1SharedMemoryCarveout();
+  // maxDynamicSmem 初始化为极大值，后续取所有普通 kernel 的最小值
   int maxDynamicSmem = 1<<30;
   int driverVersion;
   NCCLCHECK(ncclCudaDriverVersion(&driverVersion));
 
+  // sym=0: 普通 kernel（ncclDevKernelList 数组）
+  // sym=1: Symmetric kernel（ncclSymkKernelList 数组）
   for (int sym=0; sym <= 1; sym++) {
     int kcount = sym==0 ? ncclDevKernelCount : ncclSymkKernelCount;
     void** kptrs = sym==0 ? ncclDevKernelList : ncclSymkKernelList;
+    // krequires[k]: kernel k 所需的最低驱动版本号
     int* krequires = sym==0 ? ncclDevKernelRequirements : ncclSymkKernelRequirements;
     for (int k=0; k < kcount; k++) {
+      // 驱动版本不满足 → 将该 kernel 置 null，运行时不可用
       if (kptrs[k] != nullptr && driverVersion < krequires[k]) {
         INFO(NCCL_INIT, "Skipping %skernel %d which requires driver %d",
              sym ? "symmetric " : "", k, krequires[k]);
@@ -56,21 +174,29 @@ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* ma
 
       if (!CUDASUCCESS(cudaFuncGetAttributes(&attr, fn))) continue; // Silently ignore failures
 
+      // 记录所有 kernel 中最大的局部变量（栈）使用量
       if (maxStackSize) {
         if (attr.localSizeBytes > *maxStackSize) *maxStackSize = attr.localSizeBytes;
       }
+      // L1/shared memory carveout：用户可通过 NCCL_L1_SHARED_MEMORY_CARVEOUT 控制
       if (carveout) {
         CUDACHECKGOTO(cudaFuncSetAttribute(fn,
           cudaFuncAttributePreferredSharedMemoryCarveout, carveout),
           result, ignore1);
       ignore1:;
       }
+      // dynSmem = 设备总共享内存 - kernel 静态共享内存使用量
+      // 这是该 kernel 可用的最大动态共享内存
       { int dynSmem = maxSharedMem - attr.sharedSizeBytes;
         if (sym) {
+          // symk: 每个 kernel 独立记录，因为 launch 时可以单独指定 smem
           ncclSymkKernelMaxDynamicSmem[k] = dynSmem;
         } else {
+          // 普通 kernel: 取所有 kernel 中的最小值
+          // 因为发射时用统一的 ncclShmemDynamicSize(cudaArch) 值
           maxDynamicSmem = std::min(maxDynamicSmem, dynSmem);
         }
+        // 告诉 CUDA runtime 此 kernel 允许使用多少动态共享内存
         CUDACHECKGOTO(cudaFuncSetAttribute(fn,
           cudaFuncAttributeMaxDynamicSharedMemorySize, dynSmem),
           result, next_kernel);
@@ -79,6 +205,7 @@ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* ma
     }
   }
 
+  // 最终校验：确保普通 kernel 所需的动态 smem 不超过设备限制
   if (ncclShmemDynamicSize(cudaArch) > maxDynamicSmem) {
     WARN("cudaArch %d dynamic smem %d exceeds device/fn maxSharedMem %d",
          cudaArch, ncclShmemDynamicSize(cudaArch), maxDynamicSmem);
@@ -90,6 +217,10 @@ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* ma
 ////////////////////////////////////////////////////////////////////////////////
 // Data movement metrics.
 
+// ncclFuncTrafficPerByte：计算每字节数据产生的总流量倍数，用于调度算法选择
+// AllReduce: 每字节经过网络传输 2 次（ReduceScatter + AllGather）
+// AllGather、ReduceScatter: 每字节被转发 nRanks 次
+// 主要用于估算任务总流量，再由 ncclGetAlgoInfo 选择最适算法
 static inline int ncclFuncTrafficPerByte(ncclFunc_t func, int nRanks) {
   switch (func) {
   case ncclFuncAllReduce: return 2;
@@ -103,6 +234,17 @@ static inline int ncclFuncTrafficPerByte(ncclFunc_t func, int nRanks) {
 /*       Launch system : synchronization and CUDA kernel launch              */
 /*****************************************************************************/
 
+// 发射系统概述：
+// ncclAddProxyOpIfNeeded：如果任务需要网络操作，将 proxyOp 加入当前 plan 的通道队列
+// ncclAddWorkBatchToPlan：将一个 devWork 封装到 wipPlan 的对应通道的 workBatch 中
+//   workBatch 采用二进制 bitmask 小型表示哪些 slot 有效，最大内嵌 64 个 work
+// finishPlan：将 wipPlan 转化为正式 plan，确定 work 的存储方式，建立 proxy op 合并序列
+// ncclPrepareTasks：每个 ncclGroup 调用一次，对所有任务进行分析和调度
+// scheduleCollTasksToPlan：将 collective 任务分配到 plan
+// scheduleP2pTasksToPlan：将 P2P 任务分配到 plan
+// ncclLaunchPrepare：建立完整的 plan 列表（每个 plan = 一次 launch）
+// ncclLaunchKernel：发射单个 plan 对应的 CUDA kernel
+// ncclLaunchFinish：设置流同步，确保 user stream 看到所有 kernel 完成
 ncclResult_t ncclAddProxyOpIfNeeded(struct ncclComm* comm, struct ncclKernelPlan* plan, struct ncclProxyOp* op) {
   bool needed = true;
   NCCLCHECK(ncclProxySaveOp(comm, op, &needed));
@@ -296,6 +438,24 @@ bool ncclTestBudget(
   return ok;
 }
 
+// ncclTasksRegAndEnqueue：为所有传统 collective 任务构建 ncclDevWorkColl 结构体
+// ============================================================================
+// 在 ncclPrepareTasks 之后调用（实际调用在 group.cc 的 ncclLaunchPrepare 前）
+// 为每个任务构建一个 ncclDevWorkColl（或 ncclDevWorkCollReg）结构体
+// 这个结构体将被传递给 GPU kernel，描述一次 collective 操作的全部参数
+//
+// 分支逻辑：
+//   NVLS/NVLS_TREE 任务：已在 ncclPrepareTasks 第 7 阶段预构建，直接从 tmpCollWorkQueue 取出
+//   其他任务：在这里注册 buffer（ncclRegisterCollBuffers）+ 构建 devWork
+//
+// devWork 关键字段：
+//   sendbuff/recvbuff：用户传入的数据指针
+//   root：广播/归约操作的根 rank
+//   nWarps：分配给这个任务的 warp 数
+//   redOpArg：reduction 操作的标量参数（如自定义 op 的参数）
+//   regUsed：是否使用了 IPC/NVLS 注册 buffer（GPU 直接访问对方内存）
+//   netRegUsed：是否使用了网络注册 buffer（NIC 直接访问 GPU 内存，跳过 bounce buffer）
+// ============================================================================
 ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
   struct ncclKernelPlanner* planner = &comm->planner;
   struct ncclTaskColl *task;
@@ -308,12 +468,15 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
     struct ncclWorkList* workNode = NULL;
     struct ncclDevWorkColl devWork = {};
 
+    // NVLS/NVLS_TREE 任务：devWork 已在 ncclPrepareTasks 中预构建，直接从 tmpCollWorkQueue 取出
     if (task->algorithm == NCCL_ALGO_NVLS_TREE || task->algorithm == NCCL_ALGO_NVLS) {
       workNode = ncclIntruQueueDequeue(&planner->tmpCollWorkQueue);
       goto next;
     }
+    // 非 NVLS 任务：尝试注册 buffer（IPC 注册、网络注册等）
     ncclRegisterCollBuffers(comm, task, regBufSend, regBufRecv, &planner->collCleanupQueue, &regNeedConnect);
 
+    // 填充 devWork 结构体：将用户参数转化为 kernel 可读的格式
     devWork.sendbuff = (void*)task->sendbuff;
     devWork.recvbuff = (void*)task->recvbuff;
     devWork.sendbuffOffset = task->sendbuffOffset;
@@ -324,15 +487,19 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
     devWork.nWarps = task->nWarps;
     devWork.redOpArg = task->opDev.scalarArg;
     devWork.redOpArgIsPtr = task->opDev.scalarArgIsPtr;
-    devWork.oneNode = (comm->nNodes == 1);
-    devWork.isOneRPN = comm->isOneRPN;
-    devWork.netRegUsed = devWork.regUsed = 0;
+    devWork.oneNode = (comm->nNodes == 1);   // 单节点优化标志
+    devWork.isOneRPN = comm->isOneRPN;        // 每节点只有一个 rank
+    devWork.netRegUsed = devWork.regUsed = 0; // 默认不使用注册 buffer
     devWork.profilerEnabled = ncclProfilerPluginLoaded() && (task->eActivationMask & ncclProfileKernelCh);
+    // netRegUsed: NIC 直接读写 GPU 内存（跳过 host bounce buffer，降低延迟）
     if (task->regBufType & NCCL_NET_REG_BUFFER)
       devWork.netRegUsed = 1;
+    // regUsed: GPU 直接访问对方 GPU 内存（通过 IPC 或 NVLS）
     if (task->regBufType & (NCCL_IPC_REG_BUFFER | NCCL_NVLS_REG_BUFFER))
       devWork.regUsed = 1;
 
+    // 根据 buffer 注册类型选择 ncclDevWorkCollReg（带注册地址）还是 ncclDevWorkColl（普通）
+    // ncclWorkList 是侵入式链表节点，数据紧跟在节点后面（workNode+1）
     if (task->regBufType & NCCL_NVLS_REG_BUFFER) {
       struct ncclDevWorkCollReg workReg = {};
       workReg.coll = devWork; // C++ struct assignment
@@ -357,12 +524,39 @@ next:
   return ncclSuccess;
 }
 
+// ncclPrepareTasks：每个 ncclGroup 调用一次，对所有用户提交的任务进行分析和调度
+// ============================================================================
+// 输入：
+//   comm->planner 中已经累积了所有通过 ncclEnqueueCheck 入队的任务：
+//     - collSorter：所有 collective 任务（按 trafficBytes 排序）
+//     - peers[i].sendQueue/recvQueue：P2P 任务
+//     - peers[i].bcastQueue：Broadcast 任务
+//     - rmaTaskQueue：RMA 任务
+// 输出：
+//   planner->collTaskQueue：传统 collective 任务（已选好 algo/proto）
+//   planner->collSymTaskQueue：symmetric kernel 任务
+//   planner->collWorkQueue：对应的 ncclDevWorkColl 结构体
+//   algoNeedConnect[]：哪些算法需要延迟建连
+//
+// 整体流程：
+//   1. Broadcast 任务预处理（单 peer 降级为 collective）
+//   2. 从 collSorter 取出所有任务（按大小降序）
+//   3. ***symk 分流***：ncclMakeSymmetricTaskList 先尝试拿走能用 symk 的任务
+//   4. 剩余任务按 (func, op, datatype) 分组
+//   5. 对每组调 ncclGetAlgoInfo 选择最优 algo/proto
+//   6. 按 collnet/nvls 维度二次分组，拼接成最终的 collTaskQueue
+//   7. 再次遍历做 NVLS buffer 注册 + 构建 devWork 结构体
+// ============================================================================
 // Called once per ncclGroup to organize the user submitted tasks in
 // comm->planner so that they can be peeled off into plans.
 ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool* needConnect, ncclSimInfo_t* simInfo) {
   struct ncclKernelPlanner* planner = &comm->planner;
+  // 检查是否在 CUDA Graph capture 模式下
   planner->persistent = ncclCudaGraphValid(planner->capturingGraph);
 
+  // ==================== 第 1 阶段：Broadcast 任务预处理 ====================
+  // 如果 Broadcast 只有一个 peer，将其降级为普通 collective 任务
+  // 这样可以复用 collective 的调度路径（Ring/Tree 等），而不需要单独处理
   // Put bcast tasks into collSorter if there's only one bcast peer
   if (planner->bcast_info.BcastPeers == 1) {
     while (!ncclIntruQueueEmpty(&planner->peers[planner->bcast_info.minBcastPeer].bcastQueue)) {
@@ -386,19 +580,39 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     planner->bcast_info.BcastPeers = 0;
   }
 
+  // ==================== 第 2 阶段：从 sorter 取出所有 collective 任务 ====================
+  // collSorter 是一个堆排序结构，任务按 trafficBytes 降序排出
+  // trafficBytes = count * elementSize * ncclFuncTrafficPerByte（考虑算法流量倍数）
   // Tasks from the sorter come out ordered size descending.
   struct ncclTaskColl* task = ncclTaskCollSorterDequeueAll(&planner->collSorter);
+  // tasksByFnOpTy: 按 (func, redOp, datatype) 三元组的哈希桶
+  // 同一三元组的任务可以共用同一个 kernel function，可以被聚合优化
   // Tasks are assembled by (fn,op,ty) size ascending.
   struct ncclTaskColl* tasksByFnOpTy[ncclNumFuncs*ncclNumDevRedOps*ncclNumTypes];
   memset(tasksByFnOpTy, 0, sizeof(tasksByFnOpTy));
   int fnOpTyIndices[ncclNumFuncs*ncclNumDevRedOps*ncclNumTypes];
   int fnOpTyCount = 0;
 
+  // ==================== 第 3 阶段：Symmetric kernel 分流 ====================
+  // 这是 symk 和传统路径的核心分叉点！
+  // 条件：
+  //   1. comm->symmetricSupport：communicator 支持 symmetric（init 时检查）
+  //   2. !comm->p2pCrossClique：不跨 NVLink clique（symk 不支持跨 clique）
+  // ncclMakeSymmetricTaskList（定义在 symmetric_sched.cc）将遍历 task 链表：
+  //   - 对每个任务调用 ncclSymkPickKernel 尝试匹配 symk kernel
+  //   - 匹配成功的任务被转移到 collSymTaskQueue
+  //   - 匹配失败的任务留在 task 链表中，继续走传统路径
+  // 分流后：
+  //   task → 剩余的传统 collective 任务
+  //   collSymTaskQueue → symk 任务（将在 ncclLaunchPrepare 中由 ncclSymmetricTaskScheduler 处理）
   // Skip symmetric kernels for cross-clique
   if (comm->symmetricSupport && !comm->p2pCrossClique) {
     NCCLCHECK(ncclMakeSymmetricTaskList(comm, task, &planner->collSymTaskQueue, &task));
   }
 
+  // ==================== 第 4 阶段：剩余任务按 (fn,op,ty) 分组 ====================
+  // 将剩余任务按三元组 (func, redOp, datatype) 放入对应的桶中
+  // 目的：同一组的任务可以聚合计算 algo/proto，共享同一个 kernel function
   // Walk the size sorted tasks, binning them by (fn,op,ty).
   while (task != nullptr) {
     struct ncclTaskColl* next = task->next;
@@ -412,13 +626,25 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     task = next;
   }
 
+  // ==================== 第 5 阶段：按组选择 algo/proto ====================
+  // 对每个 (fn,op,ty) 组：
+  //   1. 将大小相近的任务聚合（4x 范围内），用聚合后的总流量判断最优算法
+  //   2. ncclGetAlgoInfo：核心算法选择函数
+  //      输入：总流量、collNet 支持、NVLS 支持、nRanks 等
+  //      输出：algorithm（Ring/Tree/NVLS/CollNet）、protocol（LL/LL128/Simple）、
+  //             nMaxChannels、nWarps
+  //      内部通过 ncclTopoTuneModel 的调度表或插件 tuner 做决策
+  //   3. ncclDevFuncId：将 (func, op, datatype, algo, proto) 映射为内核索引
+  //   4. 将结果写回每个任务，并按 collnet/nvls 维度分入 collBins[2][2]
   // Walk (fn,op,ty) bins, compute algo and proto etc. Then bin them by their
   // scheduling constraints (collnet x nvls).
   struct ncclIntruQueue<struct ncclTaskColl, &ncclTaskColl::next> collBins[2][2] = {};
   for (int cursor=0; cursor < fnOpTyCount; cursor++) {
     struct ncclTaskColl* aggBeg = tasksByFnOpTy[fnOpTyIndices[cursor]];
+    // 检查该组任务是否支持 CollNet（IB SHARP 硬件 reduction）
     int collNetSupport = 0;
     NCCLCHECK(ncclGetCollNetSupport(comm, aggBeg, &collNetSupport));
+    // 检查是否支持 NVLS（NVLink SHARP，节点内 NVSwitch 硬件 multicast）
     int nvlsSupport = comm->nvlsSupport && (ncclNvlsSupported(aggBeg->opDev.op, aggBeg->datatype) || aggBeg->func == ncclFuncAllGather);
     // Crudely estimate number of tasks per channel. This is using the wrong number
     // of channels for NVLS algos, but knowing the algo requires having this value,
@@ -427,6 +653,9 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     do {
       struct ncclTaskColl* aggEnd = aggBeg->next;
       struct ncclTaskColl agg = *aggBeg;
+      // 聚合策略：将大小在 4 倍范围内的任务聚合在一起
+      // 聚合后使用总 count/trafficBytes 调用 ncclGetAlgoInfo
+      // 这样可以让小任务“搭便车”享受大任务的算法选择
       // We aggregate operations that are within 4X size of each other.
       while (aggEnd != nullptr && aggEnd->trafficBytes < 4*aggBeg->trafficBytes) {
         agg.count += aggEnd->count;
@@ -434,9 +663,15 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
         aggEnd = aggEnd->next;
       }
 
+      // ncclGetAlgoInfo：传统路径的核心算法选择函数
+      // 根据聚合后的总流量、nRanks、collNet/NVLS 支持等信息，
+      // 返回最优的 algorithm、protocol、nMaxChannels、nWarps
       NCCLCHECK(ncclGetAlgoInfo(comm, &agg, collNetSupport, nvlsSupport, nTasksPerChannel, simInfo));
+      // 将 (func, op, datatype, algo, proto) 映射为内核索引
+      // 这个索引用于在 ncclDevKernelList 中查找对应的 kernel function pointer
       agg.devFuncId = ncclDevFuncId(agg.func, agg.opDev.op, agg.datatype, agg.algorithm, agg.protocol);
 
+      // 标记算法类型：用于后续按 [collnet][nvls] 维度分组
       int isCollnet=0, isNvls=0;
       switch (agg.algorithm) {
       case NCCL_ALGO_NVLS:
@@ -449,6 +684,8 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
         isCollnet = 1;
         break;
       }
+      // 将聚合的 algo/proto 结果写回每个独立任务
+      // 同时将任务放入 collBins[isCollnet][isNvls] 分组
       // Update the aggregated tasks with the computed values.
       do {
         struct ncclTaskColl* next = aggBeg->next;
@@ -466,6 +703,9 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     } while (aggBeg != nullptr);
   }
 
+  // ==================== 第 6 阶段：拼接所有分组到 collTaskQueue ====================
+  // 拼接顺序：[0][0]普通 → [0][1]NVLS → [1][0]CollNet → [1][1]NVLS+CollNet
+  // CollNet 作为外层维度，因为 CollNet 和非-CollNet 的 channel 分配策略不同
   // Concatenate `collBins[*][*]` together into final list `planner->collTaskQueue`.
   // Collnet is the outer dimension since that affects how we divide over the
   // channels.
@@ -475,6 +715,14 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     }
   }
 
+  // ==================== 第 7 阶段：NVLS buffer 注册 + 构建 devWork 结构体 ====================
+  // 再次遍历所有任务，进行三件事：
+  //   1. 尝试注册 NVLS buffer（ncclRegisterCollNvlsBuffers）
+  //      NVLS 需要将用户 buffer 注册到 NVSwitch multicast group 中
+  //   2. 检查是否需要延迟建连（runtimeConn 模式）
+  //      新版 NCCL 支持算法级别的延迟连接：只有第一次使用某算法时才建立连接
+  //   3. 为 NVLS/NVLS_TREE 任务预构建 ncclDevWorkColl 结构体
+  //      放入 tmpCollWorkQueue，后续由 ncclTasksRegAndEnqueue 合并处理
   // Walk tasks again to:
   // 1. Possibly register buffers.
   // 2. Build ncclDevWorkColl structs.
@@ -488,6 +736,9 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     bool regNeedConnect = true;
     ncclRegisterCollNvlsBuffers(comm, task, regBufSend, regBufRecv, &planner->collCleanupQueue, &regNeedConnect);
 
+    // runtimeConn：延迟连接机制
+    // 如果这个算法还没有建立连接，标记 algoNeedConnect
+    // 连接将在 ncclCollPreconnect 中建立（发生在 ncclPrepareTasks 之后）
     if (comm->runtimeConn && comm->initAlgoChannels[task->algorithm] == false) {
       if (task->algorithm == NCCL_ALGO_NVLS_TREE && comm->initAlgoChannels[NCCL_ALGO_NVLS] == false && regNeedConnect == true) {
         comm->initAlgoChannels[NCCL_ALGO_NVLS] = true;
@@ -500,8 +751,11 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
       }
     }
 
+    // 为 NVLS/NVLS_TREE 任务预构建 ncclDevWorkColl 结构体
+    // 这些任务的 devWork 需要在这里提前构建，因为它们可能需要 NVLS 注册 buffer 地址
     if (task->algorithm == NCCL_ALGO_NVLS_TREE || task->algorithm == NCCL_ALGO_NVLS) {
       struct ncclDevWorkColl devWork = {};
+      // 将用户层面的参数填入 devWork，这些会被传递给 GPU kernel
       devWork.sendbuff = (void*)task->sendbuff;
       devWork.recvbuff = (void*)task->recvbuff;
       devWork.sendbuffOffset = task->sendbuffOffset;
@@ -543,6 +797,9 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     task = task->next;
   }
 
+  // ==================== 第 8 阶段：Broadcast runtimeConn 处理 ====================
+  // 对于多 peer broadcast 任务（未降级为 collective 的），
+  // 检查是否需要为 Ring 算法建立连接
   // Process broadcast tasks for runtimeConn
   if (comm->runtimeConn && planner->nTasksBcast > 0) {
     for (int peer = planner->bcast_info.minBcastPeer; peer <= planner->bcast_info.maxBcastPeer; peer++) {
@@ -569,10 +826,34 @@ static ncclResult_t addProfilerProxyOpIfNeeded(struct ncclComm* comm, struct ncc
   return ret;
 }
 
+// scheduleCollTasksToPlan：将传统 collective 任务分配到 plan 中
+// ============================================================================
+// 这是传统路径（非 symk）的核心调度函数。它负责：
+//   1. 估算当前 plan 能装多少个任务（受 budget 限制）
+//   2. 为每个任务分配 channel（基于流量均衡的 "shortest channel first" 策略）
+//   3. 计算 chunk size（calcCollChunking）
+//   4. 生成 ncclDevWorkBatch（调用 ncclAddWorkBatchToPlan）
+//   5. 生成 ncclProxyOp（调用 ncclAddProxyOpIfNeeded）
+//
+// channel 分配策略（非 CollNet）：
+//   - 根据总流量和 channel 数计算每个 channel 的目标流量
+//   - 一个任务可以横跨多个 channel（countLo、countMid、countHi 三段）
+//   - Lo = 第一个 channel（可能是前一个任务的尾巴）
+//   - Mid = 中间的满 channel（每个处理 countMid 个元素）
+//   - Hi = 最后一个 channel（可能未填满）
+//
+// budget 限制：
+//   inArgsBytes：kernel args 中 batch 占用的字节数上限
+//   outArgsBytes：work 占用的字节数上限（Fifo 模式下为 workFifo 的一半）
+// ============================================================================
 static ncclResult_t scheduleCollTasksToPlan(
     struct ncclComm* comm, struct ncclKernelPlan* plan, struct ncclKernelPlanBudget* budget
   ) {
   struct ncclKernelPlanner* planner = &comm->planner;
+  // --- 第 1 步：估算能装多少个任务 ---
+  // 遍历 collTaskQueue，累加 workBytes 和 batch 数，直到超出 budget
+  // nPlanColls = 本次 plan 要处理的任务数
+  // trafficBytes[kind] = 每种类型的总流量，用于 channel 分配
   // Estimate number of tasks that will fit in this plan.
   int nPlanColls = 0;
   size_t trafficBytes[2*2] = {0, 0, 0, 0}; // [collnet][nvls]
@@ -600,16 +881,19 @@ static ncclResult_t scheduleCollTasksToPlan(
   plan_full:;
   } while (0);
 
+  // --- 第 2 步：逐个任务分配 channel 并生成 workBatch + proxyOp ---
   int kindPrev = -1;
-  size_t trafficPerChannel = 0;
-  int channelId = 0;
-  size_t currentTraffic = 0;
+  size_t trafficPerChannel = 0;  // 每个 channel 的目标流量
+  int channelId = 0;             // 当前走到哪个 channel
+  size_t currentTraffic = 0;     // 当前 channel 已累积的流量
   while (nPlanColls!=0 && !ncclIntruQueueEmpty(&planner->collTaskQueue)) {
     struct ncclTaskColl* task = ncclIntruQueueHead(&planner->collTaskQueue);
     struct ncclWorkList* workNode = ncclIntruQueueHead(&planner->collWorkQueue);
     struct ncclDevWorkColl* devWork = (struct ncclDevWorkColl*)(workNode+1);
     size_t elementSize = ncclTypeSize(task->datatype);
 
+    // 当 kind 切换时（如从普通切到 NVLS），重新计算 trafficPerChannel
+    // trafficPerChannel = 总流量 / channel 数，16 字节对齐
     int kind = 2*task->isCollnet + task->isNvls;
     if (kind != kindPrev) {
       trafficPerChannel = divUp(trafficBytes[kind] / nChannels[kind], 16) * 16;
@@ -619,6 +903,9 @@ static ncclResult_t scheduleCollTasksToPlan(
     }
 
     if (task->isCollnet) {
+      // === CollNet 路径 ===
+      // CollNet 任务使用所有可用 channel，每个 channel 处理相同的 count
+      // 这是因为 CollNet 通过硬件 SHARP 做 reduction，channel 间不需要分割数据
       int nChannels = task->nMaxChannels;
       // Ensure room for worst case of one new batch per channel
       if (!ncclTestBudget(budget, plan->nWorkBatches + nChannels, plan->workBytes + workNode->size)) {
@@ -649,6 +936,10 @@ static ncclResult_t scheduleCollTasksToPlan(
         NCCLCHECK(addProfilerProxyOpIfNeeded(comm, plan, &proxyOp));
       }
     } else { // not task->isCollnet
+      // === 普通 collective 路径（Ring/Tree/NVLS） ===
+      // 基于流量均衡的 channel 分配策略：
+      //   trafficPerCell = 每个“数据单元”的流量（考虑算法倍数和协议倍数）
+      //   将任务切分为 countLo/countMid/countHi 三段，分配到连续的 channel 上
       int trafficPerByte = ncclFuncTrafficPerByte(task->func, comm->nRanks);
       if (task->protocol == NCCL_PROTO_LL) trafficPerByte *= 4;
       size_t cellSize = divUp(divUp(MinTrafficPerChannel, (size_t)trafficPerByte), 16) * 16;
@@ -704,6 +995,9 @@ static ncclResult_t scheduleCollTasksToPlan(
       // calcCollChunking() uses global bytes instead of traffic which differs
       // in that allreduce isn't multiplied by 2.
       size_t globalBytesPerElement = elementSize*ncclFuncMaxSendRecvCount(task->func, comm->nRanks, 1);
+      // 为 Lo/Mid/Hi 每段分别计算 chunk size
+      // chunk size 决定了 kernel 每次处理多少数据（影响 pipeline 深度）
+      // calcCollChunking 考虑：数据量、channel 数、pipeline slot 数、协议 grain size
       struct ncclProxyOp proxyOpLo, proxyOpMid, proxyOpHi;
 
       uint32_t chunkSize, directFlags=0;
@@ -738,6 +1032,9 @@ static ncclResult_t scheduleCollTasksToPlan(
         currentTraffic = 0;
       }
 
+      // 为每个 channel 生成 proxyOp + workBatch
+      // proxyOpId: 全局唯一的操作 ID，用于 proxy 线程匹配完成通知
+      // 低 1 位 = 0 表示 collective，= 1 表示 p2p
       uint64_t proxyOpId = uint64_t(plan->collOpCount++)<<1 | 0;
       for (int c=devWork->channelLo; c <= (int)devWork->channelHi; c++) {
         struct ncclProxyOp* proxyOp;
@@ -781,8 +1078,11 @@ static ncclResult_t scheduleCollTasksToPlan(
       }
     }
 
+    // 更新 plan 的 channelMask（记录哪些 channel 被使用）
     plan->channelMask |= (2ull<<devWork->channelHi) - (1ull<<devWork->channelLo);
     plan->threadPerBlock = std::max(plan->threadPerBlock, task->nWarps*WARP_SIZE);
+    // 选择 kernel function：如果已经有特化的 kernel，就不再更新
+    // kernelSpecialized = true 意味着找到了一个可以处理当前所有任务的专用 kernel
     if (!plan->kernelSpecialized) {
       plan->kernelFn = ncclDevKernelForFunc[task->devFuncId];
       plan->kernelSpecialized = ncclDevKernelForFuncIsSpecialized[task->devFuncId];
@@ -1177,6 +1477,14 @@ static ncclResult_t scheduleP2pTasksToPlan(struct ncclComm* comm, int* p2pEpoch,
   return ncclSuccess;
 }
 
+// waitWorkFifoAvailable：自旋等待 workFifo 有足够空间
+// ============================================================================
+// workFifo 是 host 和 device 之间的 ring buffer：
+//   workFifoProduced：host 写入的累计字节数（单调递增）
+//   workFifoConsumed：GPU 完成后由 KernelFinishCallback 异步更新
+//   produced - consumed <= workFifoBytes 时有空间
+// 如果没空间，自旋等待（poll event callbacks + yield）
+// 注意：这里用的是无符号整数减法，自然处理回绕
 // Spin until its safe to increase comm->workFifoProduced to desiredProduced.
 static ncclResult_t waitWorkFifoAvailable(struct ncclComm* comm, uint32_t desiredProduced) {
   bool hasRoom = (desiredProduced - comm->workFifoConsumed) <= comm->workFifoBytes;
@@ -1212,7 +1520,29 @@ namespace {
   }
 }
 
+// uploadWork：将 devWork 结构体写入目标位置
+// ============================================================================
+// 根据 plan->workStorageType 有三种目标：
+//
+//   ncclDevWorkStorageTypeArgs（内联模式）：
+//     直接写入 plan->kernelArgs 指向的内存
+//     kernel launch 时通过 CU_LAUNCH_PARAM_BUFFER_POINTER 传入
+//     不需要 workFifo，最快的路径
+//
+//   ncclDevWorkStorageTypeFifo（ring buffer 模式）：
+//     写入 comm->workFifoBuf（host pinned memory，GPU 可见）
+//     写入位置 = fifoCursor & (workFifoBytes-1)（回绕）
+//     kernel 通过 kernelArgs->workBuf + kernelArgs->workMask 寻址
+//     需要先调用 waitWorkFifoAvailable 确保有空间
+//
+//   ncclDevWorkStorageTypePersistent（CUDA Graph 模式）：
+//     host 分配临时内存 → cudaMallocAsync 分配设备内存 → cudaMemcpyAsync 上传
+//     host 临时内存通过 uploadWork_cleanup_fn 异步释放
+//
+// symk/CE/RMA 的 plan 直接跳过（它们的参数不通过 workFifo）
+// ============================================================================
 static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* plan) {
+  // symk/CE/RMA plan 不需要 uploadWork，参数已内嵌在 kernelArgs 中
   if (plan->isSymColl || plan->isCeColl || plan->isRma) return ncclSuccess;
 
   size_t workBytes = plan->workBytes;
@@ -1220,21 +1550,27 @@ static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* pla
   void* fifoBufHost;
   uint32_t fifoCursor, fifoMask;
 
+  // 根据存储类型初始化目标 buffer 和光标
   switch (plan->workStorageType) {
   case ncclDevWorkStorageTypeArgs:
-    plan->kernelArgs->workBuf = nullptr;
+    // 内联模式：直接写入 kernelArgs 结构体后面的空间
+    plan->kernelArgs->workBuf = nullptr;  // kernel 知道 data 在 args 内
     fifoBufHost = (void*)plan->kernelArgs;
-    fifoCursor = sizeof(ncclDevKernelArgs) + batchBytes;
-    fifoMask = ~0u;
+    fifoCursor = sizeof(ncclDevKernelArgs) + batchBytes; // 工作数据在 batch 之后
+    fifoMask = ~0u; // 不需要回绕
     break;
   case ncclDevWorkStorageTypeFifo:
+    // Fifo 模式：写入共享的 workFifoBuf ring buffer
     fifoBufHost = comm->workFifoBuf;
-    fifoCursor = comm->workFifoProduced;
-    fifoMask = comm->workFifoBytes-1;
+    fifoCursor = comm->workFifoProduced;  // 当前生产者指针
+    fifoMask = comm->workFifoBytes-1;     // 回绕 mask（workFifoBytes 必须是 2 的幂）
+    // 等待 GPU 消费足够空间
     NCCLCHECK(waitWorkFifoAvailable(comm, fifoCursor + workBytes));
+    // 告诉 kernel workFifo 的设备地址
     plan->kernelArgs->workBuf = comm->workFifoBufDev;
     break;
   case ncclDevWorkStorageTypePersistent:
+    // Persistent 模式：分配临时 host 内存，后续通过 cudaMemcpyAsync 上传到设备
     // We rely on 16-byte alignment. Use aligned alloc when available (C++11+ or MSVC with /std:c++11+).
     // MSVC keeps __cplusplus at 199711L
     #if (__cplusplus >= 201103L) || (defined(_MSC_VER) && _MSVC_LANG >= 201103L)
@@ -1251,6 +1587,10 @@ static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* pla
   }
   plan->kernelArgs->workMask = fifoMask;
 
+  // 修正 batch 的 offsetBase：从 plan 内部的零基地址平移到实际地址
+  //   Args 模式：offset 基于 kernelArgs 开头
+  //   Fifo 模式：offset 基于 workFifo base
+  //   Persistent 模式：无需平移（专用 buffer 从零开始）
   // Batches were placed after kernelArgs by finishPlan(). Only thing left to
   // do is translate the work offset from zero based (in plan) to:
   //  ncclDevWorkStorageTypeArgs: offset from beginning of kernel args
@@ -1261,6 +1601,8 @@ static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* pla
     batchZero[b].offsetBase += fifoCursor;
   }
 
+  // 将 devWork 结构体按 16 字节对齐写入目标 buffer
+  // 16 字节 = 一次 GPU 缓存行读取的最小单位，保证原子可见性
   // Write the channel-shared work structs.
   struct ncclWorkList* workNode = ncclIntruQueueHead(&plan->workQueue);
   while (workNode != nullptr) {
@@ -1278,12 +1620,16 @@ static ncclResult_t uploadWork(struct ncclComm* comm, struct ncclKernelPlan* pla
     workNode = workNode->next;
   }
 
+  // 更新生产者指针 + GDR fence
   switch (plan->workStorageType) {
   case ncclDevWorkStorageTypeFifo:
+    // 推进 workFifoProduced，下次 uploadWork 从这里继续
     comm->workFifoProduced = fifoCursor;
+    // 如果 workFifo 是 GDR 映射的（通过 PCIe BAR 直写 GPU 内存），需要 fence
     if (comm->workFifoBufGdrHandle != nullptr) wc_store_fence();
     break;
   case ncclDevWorkStorageTypePersistent:
+    // Persistent 模式：分配设备内存 + 异步上传 + 注册清理回调
     { ncclResult_t result = ncclSuccess;
       struct uploadWork_cleanup_t* cleanup = nullptr;
       cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
@@ -1347,6 +1693,16 @@ static void *gettaskEventHandle(struct ncclProxyOp * op) {
   return op->task.coll->eventHandle;
 }
 
+// uploadProxyOps：将 plan 中的 proxyOp 提交给 proxy 线程
+// ============================================================================
+// proxyOp 描述了一次网络传输操作（IB RDMA send/recv、GIN put/get 等）
+// 这个函数：
+//   1. 将 plan 内部的零基 opCount 转换为全局唯一 opCount
+//      - collective: 基于 comm 的 collOpCount
+//      - p2p: 基于每个 channel 的 p2pOpCount
+//   2. 调用 ncclProxySaveOp 将 op 写入 proxy 线程的缓冲区
+//   3. 恢复原始 opCount（persistent 模式下 plan 可以被多次重放）
+// ============================================================================
 static ncclResult_t uploadProxyOps(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   uint64_t collOpCount = comm->sharedRes->collOpCount;
   uint64_t p2pOpBump[MAXCHANNELS] = {/*0...*/};
@@ -1389,6 +1745,18 @@ static ncclResult_t uploadProxyOps(struct ncclComm* comm, struct ncclKernelPlan*
   return ncclSuccess;
 }
 
+// hostStreamPlanTask：提交 proxy ops 并处理 plan 回收
+// ============================================================================
+// 调用时机：
+//   - 在 ncclLaunchKernelAfter_NoCuda 中直接调用（普通模式）
+//   - 或通过 cudaLaunchHostFunc 在 host stream 上异步调用（persistent/blocking 模式）
+// 职责：
+//   1. 启动 profiler 事件
+//   2. uploadProxyOps：提交网络操作给 proxy 线程
+//   3. ncclProxyStart：唤醒 proxy 线程开始工作
+//   4. 非 persistent 模式：将 plan 送入 callbackQueue 等待回收
+//      （plan 不能立即释放，因为 GPU 还在使用它的数据）
+// ============================================================================
 static ncclResult_t hostStreamPlanTask(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   NCCLCHECK(ncclProfilerStartGroupEvent(plan));
   NCCLCHECK(ncclProfilerStartTaskEvents(plan));
@@ -1510,9 +1878,29 @@ static ncclResult_t getImplicitOrder(enum ncclImplicitOrder *mode, bool capturin
   return ncclSuccess;
 }
 
+// ncclLaunchPrepare：将任务打包成 plan 并准备发射
+// ============================================================================
+// 这是从“任务分析”到“kernel launch”的桥梁。
+// 输入：planner 中已准备好的任务队列（来自 ncclPrepareTasks）
+// 输出：planner->planQueue 中的 plan 链表（每个 plan = 一次 kernel launch）
+//
+// 主循环逻辑（do-while）：
+//   每次迭代生成一个 plan，直到所有任务队列排空
+//   plan 构建优先级：
+//     1. RMA 任务（ncclPut/ncclGet 单边传输）
+//     2. CE 任务（Copy Engine，小数据量用 cudaMemcpy）
+//     3. Symmetric kernel 任务（collSymTaskQueue）
+//     4. 传统 collective + P2P 任务
+//
+// plan 构建后的后续处理：
+//   - 流同步：确保所有 user stream 在 kernel launch 前完成先前操作
+//   - proxy ops 提交：如需要，通过 cudaLaunchHostFunc 异步提交 proxy ops
+//   - persistent 模式：CUDA Graph 场景下增加引用计数和析构回调
+// ============================================================================
 ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
   ncclResult_t result = ncclSuccess;
   struct ncclKernelPlanner* planner = &comm->planner;
+  // persistent: CUDA Graph capture 模式，plan 会存活到 graph 析构
   bool persistent = ncclCudaGraphValid(planner->capturingGraph);
   planner->persistent = persistent;
   // Operations from different plans will not be batched together. A new batch will be created for each new plan that is used to schedule the ops (see ncclAddWorkBatchToPlan).
@@ -1520,27 +1908,38 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
   // The p2pEpoch value is incremented in scheduleP2pTasksToPlan and its value is carried over from one plan to another (even if not strictly required)
   int nPlans = 0, p2pEpoch=0, p2pRound=0;
 
+  // ==================== plan 构建主循环 ====================
+  // 每次迭代生成一个 plan，直到所有任务队列排空
   if (planner->nTasksColl + planner->nTasksP2p + planner->nTasksBcast != 0 ||
       !ncclIntruQueueEmpty(&planner->collSymTaskQueue) ||
       !ncclIntruQueueEmpty(&planner->collCeTaskQueue) ||
       planner->nTasksRma != 0) {
     do {
+      // 初始化临时工作区（wipPlan：work-in-progress plan）
       memset(&planner->wipPlan, 0, sizeof(planner->wipPlan));
 
+      // 分配 plan 结构体（每个 plan 对应一次 kernel launch）
       struct ncclKernelPlan* plan = ncclMemoryPoolAlloc<struct ncclKernelPlan>(&comm->memPool_ncclKernelPlan, &comm->memPermanent);
       plan->comm = comm;
-      plan->reclaimer.fn = reclaimPlan;
+      plan->reclaimer.fn = reclaimPlan; // plan 回收时的清理函数
       plan->persistent = persistent;
+      // 默认存储方式：persistent 用 Persistent，否则用 Fifo
+      // finishPlan() 会在任务足够小时升级为 Args（内联到 kernel args）
       // finishPlan() promotes ncclDevWorkStorageType[Fifo|Persistent]->Args if the work can fit.
       plan->workStorageType = persistent ? ncclDevWorkStorageTypePersistent
                                          : ncclDevWorkStorageTypeFifo;
 
+      // --- 优先级 1：RMA 任务（ncclPut/ncclGet 单边传输） ---
+      // RMA 任务不需要 GPU kernel，通过 proxy thread 直接执行 IB RDMA 操作
       if (planner->nTasksRma != 0) {
         NCCLCHECKGOTO(scheduleRmaTasksToPlan(comm, plan), result, failure);
         if (plan->isRma && plan->rmaArgs != NULL && plan->rmaArgs->nRmaTasks > 0) {
           ncclIntruQueueEnqueue(&planner->planQueue, plan);
           nPlans += 1;
         }
+      // --- 优先级 2：CE 任务（Copy Engine，小数据量 allgather/reduce） ---
+      // 数据量 < SYM_CE_THRESHOLD（8MB）时，用 cudaMemcpy 比 kernel 更快
+      // 不走 GPU kernel，而是直接通过 CUDA Copy Engine 执行
       } else if (!ncclIntruQueueEmpty(&planner->collCeTaskQueue)) {
         struct ncclTaskColl* task = ncclIntruQueueHead(&planner->collCeTaskQueue);
         plan->isCeColl = true;
@@ -1567,9 +1966,23 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
         ncclMemoryPoolFree(&comm->memPool_ncclTaskColl, task);
         nPlans += 1;
       } else {
+        // --- 优先级 3：Symmetric kernel 任务 ---
+        // ncclSymmetricTaskScheduler（定义在 symmetric_sched.cc）：
+        //   1. 从 collSymTaskQueue 取出任务
+        //   2. 构建 ncclSymkDevWorkArgs 参数（包含 kcomm + channelWorkRange + devWork 数组）
+        //   3. 选择对应的 symk kernel function（如 all_gather_gin）
+        //   4. 标记 plan->isSymColl = true
+        // symk 任务不需要 workFifo，参数直接通过 kernelArgs 传入
         if (!ncclIntruQueueEmpty(&planner->collSymTaskQueue)) {
           NCCLCHECKGOTO(ncclSymmetricTaskScheduler(comm, &planner->collSymTaskQueue, plan), result, failure);
         }
+        // --- 优先级 4：传统 collective + P2P 任务 ---
+        // 传统 collective 路径：
+        //   1. 优先排空 coll 任务（scheduleCollTasksToPlan）
+        //      必须先排空 coll，因为 channel 分配是基于流量的
+        //      如果先排 P2P，不同 rank 的切分点可能不一致，导致 hang
+        //   2. 再排 broadcast 任务（ncclScheduleBcastTasksToPlan）
+        //   3. 最后排 P2P 任务（scheduleP2pTasksToPlan）
         else {
           struct ncclKernelPlanBudget budget;
           budget.inArgsBytes = comm->workArgsBytes - sizeof(struct ncclDevKernelArgs);
@@ -1592,6 +2005,10 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
           }
         }
 
+        // finishPlan：为 plan 确定 work 存储方式和构建 batch 布局
+        // 如果 totalSize <= workArgsBytes，升级为 Args 模式（内联到 kernel args）
+        // 否则保持 Fifo/Persistent 模式
+        // 同时构建 batch 链表（round-robin 遍历所有 channel）+ 合并 proxy ops
         finishPlan(comm, plan);
         if (plan->workBytes != 0) {
           ncclIntruQueueEnqueue(&planner->planQueue, plan);
@@ -1608,18 +2025,28 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
 
     if (nPlans == 0) return ncclSuccess;
 
+    // ==================== 流同步 ====================
+    // 在发射 kernel 之前，确保所有 user stream 的先前操作都已完成
     cudaStream_t launchStream = planner->streams->stream;
     cudaStream_t deviceStream, launchOrder;
+    // 获取 deviceStream（NCCL 内部的强流，保证操作顺序）
     NCCLCHECKGOTO(ncclStrongStreamAcquire(planner->capturingGraph, &comm->sharedRes->deviceStream, /*concurrent=*/false, &deviceStream), result, failure);
 
+    // 多 user stream 同步：如果 ncclGroup 内有多个不同的 stream，
+    // 将它们全部同步到 launchStream（第一个 user stream）
     // userStream[0] waits on each userStream[i]...
     for (struct ncclCudaStreamList* l=planner->streams->next; l != nullptr; l = l->next) {
       CUDACHECKGOTO(cudaEventRecord(comm->sharedRes->scratchEvent, l->stream), result, failure);
       CUDACHECKGOTO(cudaStreamWaitEvent(launchStream, comm->sharedRes->scratchEvent, 0), result, failure);
     }
+    // launchStream 等待 deviceStream，确保之前的 NCCL 操作都已完成
     // userStream[0] waits on deviceStream
     NCCLCHECKGOTO(ncclStreamWaitStream(launchStream, deviceStream, comm->sharedRes->scratchEvent), result, failure);
 
+    // ==================== 隐式发射顺序（NCCL_LAUNCH_ORDER_IMPLICIT） ====================
+    // 当启用时，确保同一 GPU context 上所有 NCCL kernel 的全局发射顺序
+    // ncclImplicitOrderLaunch: 使用 LaunchCompletionEvent（CUDA 12.3+）
+    // ncclImplicitOrderSerial: 使用完成事件序列化（老驱动 fallback）
     bool capturing = ncclCudaGraphValid(planner->capturingGraph);
     enum ncclImplicitOrder implicitOrder;
     cudaError_t status = cudaSuccess;
@@ -1634,6 +2061,14 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
       NCCLCHECKGOTO(ncclStreamWaitStream(launchStream, launchOrder, comm->sharedRes->scratchEvent), result, failure);
     }
 
+    // ==================== proxy ops 提交 ====================
+    // 如果 plan 有 proxy ops（网络传输操作），需要通过 host stream 异步提交
+    // cudaLaunchHostFunc: 在 host stream 上注册回调，当之前的操作完成后触发
+    // hostStreamPlanCallback → hostStreamPlanTask → uploadProxyOps + ncclProxyStart
+    // 为什么不直接提交：
+    //   persistent 模式下必须通过 host stream（CUDA Graph 不支持直接调用）
+    //   ncclCudaLaunchBlocking 模式下需要完成后才能继续
+    //   有 persistent kernel 还在运行时，用 host stream 防止竞争
     if (!persistent && comm->sharedRes->persistentRefs) status = CUDACLEARERROR(cudaEventQuery(comm->sharedRes->hostStream.serialEvent));
     if (persistent || ncclCudaLaunchBlocking || status == cudaErrorNotReady) {
       // We have to launch host tasks to push proxy args. We are careful to only
@@ -1657,6 +2092,10 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
       }
     }
 
+    // ==================== CUDA Graph persistent 处理 ====================
+    // persistent 模式：plan 的生命周期绑定到 CUDA Graph
+    // persistentRefs 记录还有多少 persistent plan 存活
+    // persistentDestructor 作为 graph 析构回调，触发 plan 回收
     if (persistent) {
       comm->sharedRes->persistentRefs += nPlans;
       comm->localPersistentRefs += nPlans;
@@ -1667,6 +2106,15 @@ failure:
   return result;
 }
 
+// ncclLaunchKernelBefore_NoUncapturedCuda：在 kernel launch 之前的最后准备
+// ============================================================================
+// 调用时机：
+//   在 intra-process barrier 之后、kernel launch 之前
+//   这个窗口内不允许调用非捕获的 CUDA API（防止不同 rank 的死锁）
+// 职责：
+//   调用 uploadWork 将 devWork 写入目标位置（Fifo/Args/Persistent）
+//   对于 symk/CE/RMA plan，uploadWork 会直接返回（无需操作）
+// ============================================================================
 ncclResult_t ncclLaunchKernelBefore_NoUncapturedCuda(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   // This code is called after we've checked in to the intra-process barrier
   // but before launching the kernel. We are not allowed to call CUDA unless the
@@ -1680,18 +2128,81 @@ ncclResult_t ncclLaunchKernelBefore_NoUncapturedCuda(struct ncclComm* comm, stru
 NCCL_PARAM(MemSyncDomain, "MEM_SYNC_DOMAIN", cudaLaunchMemSyncDomainRemote);
 #endif
 
+// ncclLaunchKernel：将一个 plan 发射为 CUDA kernel
+// ============================================================================
+// grid = {nChannels, 1, 1}：每个 channel 一个 block（这是 NCCL 的基本执行模型）
+// block = {threadPerBlock, 1, 1}：通常为 256 或 512 线程
+// smem：普通 kernel 用 ncclShmemDynamicSize(cudaArch)，Symmetric kernel 用 kernelDynSmem
+//
+// 新增特性解析：
+//   CGA（Cooperative Group Array / Thread Block Cluster）：sm90+ 尓用
+//     clusterSize = comm->config.cgaClusterSize，必须整除 grid.x
+//     内部并行的 CTA 共享 L2 cache 行，相互可看到对方 smem
+//     主要用于 NVLS multi-block AllReduce
+//   MemSyncDomain：CUDA 12.0+，sm90+
+//     NCCL 默认用 "Remote" 内存同步域，优化多个 GPU 间的 flushing 开销
+//   LaunchCompletionEvent：CUDA 12.3+
+//     发射自动记录一个 event，用于建立全局发射顺序（launchOrder stream）
+//   ProgrammaticStreamSerialization：Symmetric kernel 在 sm90+用，默认序列化内核调度
+//   NVLinkUtilCentricScheduling： CUDA 13.0+，sm100+，优化 NVLink 带宽利用率
+// ============================================================================
+// ncclLaunchKernel：将一个 plan 发射为 CUDA kernel
+// ============================================================================
+// 发射参数：
+//   grid = {nChannels, 1, 1}：每个活跃 channel 一个 thread block
+//     这是 NCCL 的基本执行模型：每个 block 独立处理一个 channel 的数据
+//     channel 数由 ncclGetAlgoInfo 决定，典型值 2-32
+//   block = {threadPerBlock, 1, 1}：通常 256 或 512 线程
+//     由 nWarps * WARP_SIZE 确定，不同 algo 可能不同
+//   smem：动态共享内存大小
+//     普通 kernel：ncclShmemDynamicSize(cudaArch)，所有 kernel 统一值
+//     Symmetric kernel：plan->kernelDynSmem，每个 symk kernel 独立计算
+//
+// kernel function：
+//   plan->kernelFn：kernel 的函数指针
+//     普通 kernel：从 ncclDevKernelForFunc[devFuncId] 查表得到
+//     Symmetric kernel：从 ncclSymkKernelList[kernelId] 查表得到
+//
+// kernel args：
+//   通过 CU_LAUNCH_PARAM_BUFFER_POINTER 传入 plan->kernelArgs
+//   布局：[ncclDevKernelArgs][WorkBatch数组][Work数据（Args模式）]
+//   对于 symk：传入 ncclSymkDevWorkArgs（kcomm + channelWorkRange + devWork）
+//
+// 特性属性（通过 cuLaunchKernelEx 的 CUlaunchAttribute 设置）：
+//   CGA（Thread Block Cluster）：sm90+
+//     clusterSize = comm->config.cgaClusterSize，必须整除 grid.x
+//     同一 cluster 内的 block 保证并发调度，可直接访问对方 smem
+//     主要用于 NVLS multi-block AllReduce
+//   MemSyncDomain：CUDA 12.0+，sm90+
+//     NCCL 默认用 "Remote" 同步域，降低跨 GPU fence 的开销
+//     原理：将 NCCL 的 fence 和用户 kernel 的 fence 分离，避免互相等待
+//   LaunchCompletionEvent：CUDA 12.3+
+//     kernel 发射时自动记录一个 event，用于建立全局发射顺序
+//     比“完成事件”更高效：不需要等 kernel 完成，只需确认已发射
+//   ProgrammaticStreamSerialization：CUDA 12.3+，sm90+
+//     symk kernel 专用：允许硬件调度器自动序列化同一 stream 上的连续 kernel
+//     减少 kernel launch 间的 gap，提高 GPU 利用率
+//   NVLinkUtilCentricScheduling：CUDA 13.0+，sm100+
+//     优化 NVLink 带宽利用率，硬件级别的 SM 调度优化
+// ============================================================================
 ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   ncclResult_t ret = ncclSuccess;
   struct ncclKernelPlanner* planner = &comm->planner;
+  // nChannels: 从 channelMask 中计算活跃 channel 数 = grid 的 block 数
   int nChannels = countOneBits(plan->channelMask);
+  // sym: kernel function pointer，后续通过 cudaGetFuncBySymbol 转为 CUfunction
   void* sym = plan->kernelFn;
   dim3 grid = {(unsigned)nChannels, 1, 1};
   dim3 block = {(unsigned)plan->threadPerBlock, 1, 1};
+  // symk 有独立的 smem 大小，普通 kernel 统一用 ncclShmemDynamicSize
   int smem = plan->isSymColl ? plan->kernelDynSmem : ncclShmemDynamicSize(comm->cudaArch);
   cudaStream_t launchStream = planner->streams->stream;
 
   NCCLCHECK(ncclProfilerStartKernelLaunchEvent(plan, launchStream));
 
+  // extra[]: cuLaunchKernel 的额外参数
+  // kernelArgs 指向 [ncclDevKernelArgs][batch数组][work数据]
+  // kernelArgsSize 告诉 CUDA runtime 总大小
   void* extra[] = {
     CU_LAUNCH_PARAM_BUFFER_POINTER, plan->kernelArgs,
     CU_LAUNCH_PARAM_BUFFER_SIZE, &plan->kernelArgsSize,
@@ -1701,9 +2212,11 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
   int driverVersion;
   NCCLCHECKGOTO(ncclCudaDriverVersion(&driverVersion), ret, do_return);
 
+  // 获取 CUfunction handle（从 device symbol 转换）
   CUfunction fn;
   CUDACHECKGOTO(cudaGetFuncBySymbol(&fn, sym), ret, do_return);
 
+  // CUDA 11.8+ 使用 cuLaunchKernelEx（支持属性设置）
   if (CUDART_VERSION >= 11080 && driverVersion >= 11080) {
   #if CUDART_VERSION >= 11080
     int compCap = comm->compCap;
@@ -1723,6 +2236,8 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
      * The maximum value is 8 and it must be divisible into the grid dimensions
      */
     if (clusterSize) {
+      // CGA: 同一 cluster 内的 block 保证并发调度，可直接访问对方 smem
+      // 必须整除 grid.x，否则降级为 clusterSize=1
       // Grid dimension must be divisible by clusterSize
       if (grid.x % clusterSize) clusterSize = 1;
       launchAttrs[attrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
@@ -1747,6 +2262,8 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
       attrs++;
     }
     if (plan->isSymColl && compCap >= 90 && driverVersion >= 12030) {
+      // ProgrammaticStreamSerialization: 允许硬件自动序列化同 stream 的连续 kernel
+      // 只对 symk 启用，因为 symk 的 launch 间隔特别短
       launchAttrs[attrs].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
       launchAttrs[attrs].value.programmaticStreamSerializationAllowed = 1;
       attrs++;
@@ -1759,6 +2276,7 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
       attrs++;
     }
     #endif
+    // 填充 launchConfig 结构体，传给 cuLaunchKernelEx
     launchConfig.gridDimX = grid.x;
     launchConfig.gridDimY = grid.y;
     launchConfig.gridDimZ = grid.z;
@@ -1769,9 +2287,14 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
     launchConfig.attrs = launchAttrs;
     launchConfig.numAttrs = attrs;
     launchConfig.hStream = launchStream;
+    // cuLaunchKernelEx: 带属性的 kernel 发射
+    // fn: kernel function handle
+    // nullptr: 不使用 kernelParams（改用 extra[] 中的 buffer pointer）
+    // extra: 包含 kernelArgs 的地址和大小
     CUCHECKGOTO(cuLaunchKernelEx(&launchConfig, fn, nullptr, extra), ret, do_return);
   #endif
   } else {
+    // CUDA < 11.8: 使用标准 cuLaunchKernel（不支持 CGA/MemSyncDomain 等属性）
     // Standard kernel launch
     CUCHECKGOTO(cuLaunchKernel(fn, grid.x, grid.y, grid.z, block.x, block.y, block.z, smem, launchStream, nullptr, extra), ret, do_return);
   }
@@ -1781,8 +2304,20 @@ do_return:
   return ret;
 }
 
+// ncclLaunchKernelAfter_NoCuda：kernel launch 后的处理（不允许调用 CUDA API）
+// ============================================================================
+// 调用时机：kernel launch 之后、intra-process barrier 释放之前
+// 为什么不能调用 CUDA：
+//   在这个窗口内，如果未捕获 CUDA graph，调用 CUDA API 可能会造成死锁
+//   因为其他 rank 可能正在等待 barrier
+// 职责：
+//   如果 proxy ops 还没通过 host stream 提交（isHostCbEnq == false），
+//   直接调用 hostStreamPlanTask 提交它们
+//   isHostCbEnq == true 表示已在 ncclLaunchPrepare 中通过 cudaLaunchHostFunc 提交
+// ============================================================================
 ncclResult_t ncclLaunchKernelAfter_NoCuda(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   if (!plan->isHostCbEnq) {
+    // 普通模式：直接在当前线程提交 proxy ops + 注册 plan 回收
     // we are not using the host stream for proxy ops and reclaimation submission, call
     // hostStreamPlanTask directly
     NCCLCHECK(hostStreamPlanTask(comm, plan));
@@ -1790,6 +2325,9 @@ ncclResult_t ncclLaunchKernelAfter_NoCuda(struct ncclComm* comm, struct ncclKern
   return ncclSuccess;
 }
 
+// KernelFinishCallback：workFifo 回收机制
+// 当 GPU 完成 kernel 后，通过 event callback 更新 workFifoConsumed
+// 这样 uploadWork 就知道可以覆写 ring buffer 的哪些区域
 namespace {
   struct KernelFinishCallback {
     struct ncclCommEventCallback base;
@@ -1806,6 +2344,42 @@ namespace {
   }
 }
 
+// ncclLaunchFinish：就发射完成后的后续处理
+// ============================================================================
+//   1. 重置 planQueue（不销毁 plan，让它们通过 callbackQueue 回收）
+//   2. 在 launchStream 上记录 finishedEvent
+//   3. 如果 workFifo 使用量超过一定阈值，创建 KernelFinishCallback
+//      当 GPU 完成后回调 KernelFinishCallback_fn，更新 workFifoConsumed
+//   4. deviceStream 等待 launchStream 完成（fast-forward 优化）
+//   5. 其他 user stream 等待 finishedEvent
+//   6. 将发射事件并入 launchOrder（确保全局发射顺序）
+//
+// workFifo 回收逻辑：
+//   workFifoProduced：每次 upload 一次 work 时 +1（轮内生产者）
+//   workFifoConsumed：GPU 完成后 通过 KernelFinishCallback 更新（轮外消费者）
+//   两者之差 <= workFifoBytes；当就将山时 uploadWork 会 spin wait
+// ============================================================================
+// ncclLaunchFinish：发射完成后的后续处理
+// ============================================================================
+// 在所有 plan 的 kernel 都已发射后调用，负责：
+//
+//   1. 在 launchStream 上记录 finishedEvent
+//      这个 event 代表“所有 kernel 都已发射”（注意：不是完成，是发射）
+//
+//   2. workFifo 回收：如果 workFifo 使用量超过 1/8，创建 KernelFinishCallback
+//      GPU 完成后回调 KernelFinishCallback_fn，更新 workFifoConsumed
+//      这样 uploadWork 就知道可以重用 ring buffer 的哪些区域
+//
+//   3. deviceStream fast-forward：
+//      deviceStream 等待 launchStream 完成（用 ncclStreamAdvanceToEvent 优化）
+//      这是因为 launchStream 已经 sync 过 deviceStream，可以“快进”
+//
+//   4. 多 user stream 同步：
+//      其他 user stream 等待 finishedEvent，确保用户的后续操作看到所有 NCCL 结果
+//
+//   5. launchOrder 更新：
+//      将发射事件并入全局 launchOrder stream，确保发射顺序
+// ============================================================================
 ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
   struct ncclKernelPlanner* planner = &comm->planner;
   if (!ncclIntruQueueEmpty(&planner->planQueue)) {
@@ -1815,9 +2389,12 @@ ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
 
     cudaStream_t launchStream = planner->streams->stream; // First user stream gets launch
     cudaStream_t deviceStream, launchOrder;
+    // 在 launchStream 上记录完成事件，代表所有 kernel 都已发射
     cudaEvent_t finishedEvent = comm->sharedRes->scratchEvent;
     CUDACHECK(cudaEventRecord(finishedEvent, launchStream));
 
+    // workFifo 回收：当使用量超过 1/8 时，注册回调异步更新 consumed 指针
+    // 不是每次都回收，而是累积到一定量才回收，减少 event 创建开销
     if (comm->workFifoProduced - comm->workFifoProducedLastRecorded > comm->workFifoBytes/8) {
       comm->workFifoProducedLastRecorded = comm->workFifoProduced;
       struct KernelFinishCallback* cb;
@@ -1842,24 +2419,35 @@ ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
     // But instead we do:
     NCCLCHECK(ncclStreamAdvanceToEvent(planner->capturingGraph, deviceStream, finishedEvent));
 
+    // 多 user stream 同步：其他 user stream 等待 finishedEvent
+    // 确保用户的后续操作能看到 NCCL 的所有结果
     // Each userStream[i] waits on userStream[0]
     for (struct ncclCudaStreamList* l=planner->streams->next; l != nullptr; l = l->next) {
       CUDACHECK(cudaStreamWaitEvent(l->stream, finishedEvent, 0));
     }
+    // ── 步骤 5：隐式发射顺序更新（与 ncclLaunchPrepare 对称配对） ──
+    // 在 ncclLaunchPrepare 中我们 Acquire 了 launchOrder 强流来保证多 comm 按序发射，
+    // 这里需要将 kernel 的完成/启动事件注入该顺序链并 Release 强流。
     bool capturing = ncclCudaGraphValid(planner->capturingGraph);
     enum ncclImplicitOrder implicitOrder;
     NCCLCHECK(getImplicitOrder(&implicitOrder, capturing));
     if (implicitOrder != ncclImplicitOrderNone) {
       // As in ncclLaunchPrepare, strong stream can be non-concurrent when non-captured.
+      // 非 graph-capture 模式不可并发，以遵守确定性程序顺序
       bool concurrent = capturing;
       // Incorporate launch event into per-device (context) launch order.
+      // 获取 launchOrder 强流的工作流，用于注入事件
       NCCLCHECK(ncclStrongStreamAcquiredWorkStream(planner->capturingGraph, &comm->context->launchOrder, concurrent, &launchOrder));
       // If we don't have launch events (requires CUDA 12.3) then just use completion event (serialize execution).
+      // 如果有 LaunchEvent（CUDA 12.3+），用 launchEvent 即可（只需排序发射时刻）；
+      // 否则退化为 finishedEvent（序列化整个执行，性能较低）
       CUDACHECK(cudaStreamWaitEvent(launchOrder, implicitOrder == ncclImplicitOrderLaunch ? comm->sharedRes->launchEvent : finishedEvent));
       // Release launchOrder as acquired in ncclLaunchPrepare()
+      // 释放在 ncclLaunchPrepare 中 Acquire 的 launchOrder 强流
       NCCLCHECK(ncclStrongStreamRelease(planner->capturingGraph, &comm->context->launchOrder, concurrent));
     }
     // Release deviceStream as acquired in ncclLaunchPrepare()
+    // 释放在 ncclLaunchPrepare 中 Acquire 的 deviceStream 强流
     NCCLCHECK(ncclStrongStreamRelease(planner->capturingGraph, &comm->sharedRes->deviceStream, /*concurrent=*/false));
   }
   return ncclSuccess;
@@ -1869,6 +2457,14 @@ ncclResult_t ncclLaunchFinish(struct ncclComm* comm) {
 /* Enqueueing system : computation of kernel and proxy operations parameters */
 /*****************************************************************************/
 
+// 入队系统概述：
+// ncclGetCollNetSupport：判断当前 collective 是否可用 CollNet（IB SHARP）
+//   需要：所有 channel 都有 CollNet 连接 + 算子/类型支持
+// ncclGetAlgoInfo：选择最优算法（Ring/Tree/NVLS/CollNet）和协议（LL/LL128/Simple）
+//   根据流量 + 节点数 + nRanks + 算法延迟 做出决策
+//   用 ncclTopoTuneModel 的调度表，或插件垄入的 tuner
+// ncclEnqueueCheck：每次 ncclAllReduce 等 API 调用的入口
+//   内存对齐、类型检查、count=0 忪path、封装成 ncclTaskColl 入队
 ncclResult_t ncclGetCollNetSupport(
     struct ncclComm* comm, struct ncclTaskColl* info, int* collNetSupport
   ) {

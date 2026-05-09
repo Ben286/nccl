@@ -226,6 +226,7 @@ static void initPluginLibsOnceFunc() {
   }
 
   // Add internal ib plugin
+  // 如果外部 libnccl-gin.so 没有找到，那就用内置的 ncclGinIb，然后 ncclGinIb 内部 init 时会再转换为 proxy 或 gdaki
   ginPluginLibs[pluginCounter].ncclGin = &ncclGinIb;
   ginPluginLibs[pluginCounter].ncclGinPluginState = ncclGinPluginStateInitReady;
   ginPluginLibs[pluginCounter].ncclGinVersion = ncclGinVersion[0];
@@ -256,9 +257,11 @@ ncclResult_t ncclGinInit(struct ncclComm* comm) {
     }
     if (ginPluginLibs[pluginIndex].ncclGinPluginState >= ncclGinPluginStateInitReady) {
       // plugin init must be done by all comms to setup the context, therefore we use ">="
+      // 在这里 init ncclGinIb 时就会先 try gdaki 再 try proxy，try 成功后就直接转换
       NCCLCHECK(ncclGinPluginInit(comm, &ginPluginLibs[pluginIndex]));
       if (ginPluginLibs[pluginIndex].ncclGinPluginState == ncclGinPluginStateEnabled) {
         bool isAssigned = false;
+        // 将插件相关信息填充到 comm 中，包括当前插件是 gdaki 还是 proxy
         NCCLCHECK(ncclGinPluginAssignToComm(comm, pluginIndex, &isAssigned));
         if (isAssigned) {
           // If one external plugin is assigned to a comm, then disable all other external plugins

@@ -158,6 +158,7 @@ NCCL_DEVICE_INLINE constexpr ncclGinSignalDescriptor ncclGin_getSignalDescriptor
 #endif
 
 #if NCCL_CHECK_CUDACC
+// example 里面走的是这里
 NCCL_DEVICE_INLINE constexpr ncclGinSignalDescriptor ncclGin_getSignalDescriptor(ncclGin const& net, ncclGin_SignalInc arg) {
   ncclGinSignalDescriptor desc{};
   desc.type = NCCL_GIN_SIGNAL_TYPE_INDEXED;

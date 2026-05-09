@@ -48,8 +48,57 @@
 #define NCCL_GROUP_CUDA_STREAM 1 // CGMD: CUDA 9.0,9.1 Need to use an internal CUDA stream
 #endif
 
+// ============================================================================
+// NCCL 初始化全流程概览（相比 2.11 版本的新增内容概述）
+// ============================================================================
+// 2.11 之后 NCCL 增加了大量新特性，核心变化：
+//
+// 1. [NVLS] NVLink SHARP：利用 NVSwitch 做片上 reduce，取代传统 AllReduce
+//    相关文件：src/device/nvls/，枚举值 NCCL_ALGO_NVLS / NCCL_ALGO_NVLS_TREE
+//
+// 2. [CollNet] 网络端 collective offload，把 reduce 卸载到 IB switch/SHARP
+//    相关文件：src/transport/net_ib_addr.cc，NCCL_ALGO_COLLNET_DIRECT/CHAIN
+//
+// 3. [Symmetric / Device API] 全新的编程模型，使用 ncclDevCommCreate() 创建
+//    设备端通信子，允许 GPU kernel 直接调用 NCCL 通信原语（put/waitSignal 等）
+//    相关文件：src/dev_runtime.cc，src/include/nccl_device/
+//    状态存储在 comm->devrState（ncclDevrState）
+//
+// 4. [GIN] GPU Initiated Network：GPU kernel 直接发起 RDMA 操作，有两种后端：
+//    a) GIN_PROXY：GPU 写 GFD 队列 → CPU proxy 线程转发给 IB；兼容性好
+//    b) GIN_GDAKI：GPU 直接操作 DOCA GPUNetIO verbs QP；真正 bypass CPU
+//    相关文件：src/gin/，src/include/nccl_device/gin/
+//    状态存储在 comm->sharedRes->ginState
+//
+// 5. [PAT] Pairwise Exchange Accumulate Tree：新的 AllReduce 算法
+//    NCCL_ALGO_PAT，只用于 1 GPU/node 的场景
+//
+// 6. [RMA] Remote Memory Access：通过 ncclPut/ncclGet 实现异步单边通信
+//    相关文件：src/rma/，comm->rmaState
+//
+// 7. [MNNVL] Multi-Node NVLink：跨节点 NVLink（NVLink Switch 跨机型）
+//    允许多个节点的 GPU 之间通过 NVLink 连接，类似 intra-node 的连接特性
+//
+// 8. [CGA] Cooperative Group Array：支持在一次 kernel launch 中跨 CTA 同步
+//    配置项：comm->config.cgaClusterSize
+//
+// 9. [WorkFifo / WorkArgs] kernel 参数传递方式演进：
+//    旧版：每个 kernel launch 把参数放到 workFifo ring buffer（共享内存通道）
+//    新版：支持直接通过 kernel launch args 传递（workArgs，更小的 syscall overhead）
+//    CC（Confidential Computing）模式下 workFifo 被禁用，只用 workArgs
+//
+// 10. [ncclCommSplit / ncclCommGrow / ncclCommShrink]：comm 生命周期管理扩展
+//     Split：从一个 parent comm 分裂出更小的子 comm，可选择共享 sharedRes
+//     Grow：在线扩展参与者数量
+//     Shrink：在线减少参与者数量
+// ============================================================================
+
+// NCCL 支持的 5 种集合通信函数
 const char* ncclFuncStr[NCCL_NUM_FUNCTIONS] = { "Broadcast", "Reduce", "AllGather", "ReduceScatter", "AllReduce" };
+// 支持的算法：Tree(二叉树), Ring(环形), CollNetDirect(网络直连), CollNetChain(网络链式),
+// NVLS(NVLink SHARP), NVLSTree(NVLS+树形), PAT(Pairwise Exchange Accumulate Tree)
 const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = { "Tree", "Ring", "CollNetDirect", "CollNetChain", "NVLS", "NVLSTree", "PAT" };
+// 支持的协议：LL(低延迟), LL128(低延迟128字节对齐), Simple(简单高带宽)
 const char* ncclProtoStr[NCCL_NUM_PROTOCOLS] = { "LL", "LL128", "Simple" };
 
 NCCL_PARAM(GroupCudaStream, "GROUP_CUDA_STREAM", NCCL_GROUP_CUDA_STREAM);
@@ -143,9 +192,16 @@ static ncclResult_t initResult = ncclSuccess;
 static std::once_flag initOnceFlag;
 
 static void initOnceFunc() {
+  // 全进程生命周期只初始化一次（std::call_once 保证线程安全）
+  // 1. 初始化 OS 层（设置线程栈大小等）
   NCCLCHECKGOTO(ncclOsInitialize(), initResult, exit);
+  // 2. 初始化 GDR Copy（若 NCCL_GDRCOPY_ENABLE=1）
+  //    GDR Copy 允许 CPU 直接访问 GPU memory（通过 nvidia-peermem 驱动）
+  //    主要用于 workFifo 映射到 GPU memory，避免 PCIe roundtrip
   initGdrCopy();
   // Always initialize bootstrap network
+  // 3. 初始化 bootstrap 网络（TCP socket，用于 rank 间交换控制信息）
+  //    bootstrap 网络只在 init 阶段用，不走高性能的 IB/NVLink 路径
   NCCLCHECKGOTO(bootstrapNetInit(), initResult, exit);
 
   initNvtxRegisteredEnums();
@@ -179,6 +235,9 @@ ncclResult_t ncclGetVersion(int* version) {
 
 NCCL_API(ncclResult_t, ncclGetUniqueId, ncclUniqueId* out);
 ncclResult_t ncclGetUniqueId(ncclUniqueId* out) {
+  // ncclGetUniqueId() 只需要被调用一次（通常由 rank 0 调用）
+  // 生成的 UniqueId 通过用户自己的通信手段（MPI/socket/etc）广播给所有 rank
+  // UniqueId 本质上是 bootstrap 服务器的网络地址（IP:port + 随机 magic）
   NCCLCHECK(ncclInitEnv());
   NCCLCHECK(ncclInit());
   NCCLCHECK(PtrCheck(out, "GetUniqueId", "out"));
@@ -186,6 +245,7 @@ ncclResult_t ncclGetUniqueId(ncclUniqueId* out) {
   NCCLCHECK(bootstrapGetUniqueId(&handle, NULL));
   // ncclUniqueId and bootstrapHandle don't have the same size and alignment
   // reset to 0 to avoid undefined data
+  // ncclUniqueId 和 bootstrapHandle 大小不同，先清零避免信息泄露
   memset(out, 0, sizeof(*out));
   // copy to avoid alignment mismatch
   memcpy(out, &handle, sizeof(handle));
@@ -435,6 +495,10 @@ exit:
   return ret;
 }
 
+// ----------------------------------------------------------------------------
+// commAlloc()：分配并初始化 ncclComm 的基础字段
+// 在 ncclCommInitRankFunc 的早期阶段调用，此时 bootstrap 已完成但 topo 尚未探测
+// ----------------------------------------------------------------------------
 static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, int ndev, int rank) {
   if (ndev < 1) {
     WARN("invalid device count (%d) requested", ndev);
@@ -445,9 +509,12 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
     return ncclInvalidArgument;
   }
 
+  // memPermanent：整个 comm 生命周期内不会释放的内存（用 ncclMemoryStack 管理）
+  //   好处：避免频繁 malloc/free，批量释放（析构时一次性归还）
+  // memScoped：用于 init 过程中的临时分配，init 结束后可以 pop 释放
   ncclMemoryStackConstruct(&comm->memPermanent);
   ncclMemoryStackConstruct(&comm->memScoped);
-  comm->destructorHead = nullptr;
+  comm->destructorHead = nullptr;  // LIFO 链表，comm 析构时依次执行
   comm->rank = rank;
   comm->nRanks = ndev;
 
@@ -456,24 +523,40 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
   CUDACHECK(cudaGetDevice(&comm->cudaDev));
   comm->compCap = ncclCudaCompCap();
 
+  // sharedRes（ncclSharedResources）：同一进程内多个 comm 可以共享的资源
+  // 典型场景：ncclCommSplit(splitShare=1) 的子 comm 和父 comm 共享同一个
+  //   - proxy state（代理线程）
+  //   - channel peers（传输连接）
+  //   - CUDA stream（deviceStream/hostStream）
+  //   - GIN state（GIN 连接状态）
   if (parent == NULL || !parent->shareResources) {
+    // 创建全新的 sharedRes（普通 ncclCommInitRank，或 splitShare=0 的 split）
     struct ncclSharedResources* sharedRes;
     NEW_NOTHROW(sharedRes, ncclSharedResources);
     /* most of attributes are assigned later in initTransportsRank(). */
-    sharedRes->owner = comm;
+    sharedRes->owner = comm;  // 第一个创建 sharedRes 的 comm 是 owner，负责最终析构
     sharedRes->tpNRanks = comm->nRanks;
     NCCLCHECK(ncclCalloc(&sharedRes->tpRankToLocalRank, comm->nRanks));
+    // deviceStream：所有 CUDA 内存分配/拷贝操作在这条 stream 上异步执行
+    // hostStream：proxy 等 host 端辅助操作
     NCCLCHECK(ncclStrongStreamConstruct(&sharedRes->deviceStream));
     NCCLCHECK(ncclStrongStreamConstruct(&sharedRes->hostStream));
     CUDACHECK(cudaEventCreateWithFlags(&sharedRes->launchEvent, cudaEventDisableTiming));
     CUDACHECK(cudaEventCreateWithFlags(&sharedRes->scratchEvent, cudaEventDisableTiming));
     comm->sharedRes = sharedRes;
     sharedRes->refCount = 1;
+    // 加载并初始化网络插件（libncclnet.so 或内置 IB/Socket）
+    // ncclNetInit 会：加载 .so → 调用 plugin->init() → 探测 NIC 设备数量
     NCCLCHECK(ncclNetInit(comm));
+    // 加载并初始化 GIN 插件（libncclgin.so），探测 GIN 设备，设置 ginType
+    // GIN 类型判断：看 netDeviceType 是 GIN_PROXY 还是 GIN_GDAKI
     NCCLCHECK(ncclGinInit(comm));
   } else {
+    // 共享父 comm 的 sharedRes（splitShare=1 时）
+    // 引用计数 +1，析构时 -1，为 0 时才真正释放
     comm->sharedRes = parent->sharedRes;
     ncclAtomicRefCountIncrement(&parent->sharedRes->refCount);
+    // 从父 comm 继承网络/GIN 插件引用，不重新 dlopen
     NCCLCHECK(ncclNetInitFromParent(comm, parent));
     NCCLCHECK(ncclGinInitFromParent(comm, parent));
   }
@@ -564,6 +647,19 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
   return ncclSuccess;
 }
 
+// ----------------------------------------------------------------------------
+// devCommSetup()：创建 GPU 上的 ncclKernelComm 结构体
+//
+// NCCL kernel 必须在 GPU 运行，所以需要把 host 上的各种手皮拷贝到 GPU memory。
+// 此函数就是做这个“镜像”操作。
+//
+// GPU 上的 ncclKernelComm 包含：
+//   - rank, nRanks, node, nNodes
+//   - abortFlag（device 内存地址）
+//   - buffSizes[]，p2pChunkSize
+//   - channels[]：每个 channel 的 ring/tree/nvls 目标，包含 peer 指针数组
+//   - rankToLocalRank[]：GPU 内存附加
+// ----------------------------------------------------------------------------
 static ncclResult_t devCommSetup(ncclComm_t comm) {
   ncclResult_t ret = ncclSuccess;
   int nRanks = comm->nRanks;
@@ -573,6 +669,12 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   bool ccEnable;
   cudaStream_t deviceStream;
 
+  // 从 workFifo 异步点发状态说起：
+  // CC（Confidential Computing）模式下， GPU 内存不能被 CPU 直接写入，因此
+  //   workFifo（连接 CPU->GPU 的共享内存）被完全禁用 (workFifoBytes = 0)
+  //   kernel 参数只能通过 kernel launch args（直接嵌入 launch 参数）传递
+  // 非 CC 模式：优先用 GDR mapped CUDA memory 作为 workFifo
+  //   可选 ncclCalloc 的 cudaHost 内存作为 fallback
   memset(&tmpCommAndChans, '\0', sizeof(tmpCommAndChans));
   NCCLCHECKGOTO(ncclStrongStreamAcquire(ncclCudaGraphNone(comm->config.graphUsageMode), &comm->sharedRes->deviceStream, /*concurrent=*/false, &deviceStream), ret, fail);
   NCCLCHECKGOTO(ncclCudaCallocAsync(&devCommAndChans, 1, deviceStream, comm->memManager), ret, fail);
@@ -594,6 +696,9 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   tmpCommAndChans.comm.p2pCrossClique = comm->p2pCrossClique;
   tmpCommAndChans.comm.channels = &devCommAndChans->channels[0];
 
+  // comm->workArgsBytes: 单次 launch 内联 args 的上限
+  //   新 workArgs 机制：当 collective 小到将参数直接嵌入 launch args 时，无需 workFifo roundtrip
+  //   ncclMaxKernelArgsSize() 会查询 GPU 支持的最大 launch args 大小
   comm->workArgsBytes = std::min<size_t>(ncclParamWorkArgsBytes(), ncclMaxKernelArgsSize(comm->cudaArch));
 
   memset(&ccStatus, 0, sizeof(ccStatus));
@@ -928,6 +1033,51 @@ static ncclResult_t ncclP2pSchedule(struct ncclComm* comm) {
   return ncclSuccess;
 }
 
+// ============================================================================
+// initTransportsRank()：NCCL 初始化的核心函数，完成全部 rank 间协商与连接建立
+//
+// 整体流程（两次 AllGather + 中间的本地处理）：
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │  Phase 1: AllGather1 - 交换 peerInfo（每 rank 的基本信息）              │
+// │    每个 rank 填充 ncclPeerInfo（rank/cudaDev/busId/hostHash/pidHash/    │
+// │    gdrSupport/fabricInfo/ginType 等），通过 bootstrap TCP 做全局广播    │
+// │    目的：让每个 rank 知道所有其他 rank 的设备和特性                     │
+// │    副产品：检测 NCCL 版本一致性、重复 GPU、GIN 全局支持情况             │
+// ├─────────────────────────────────────────────────────────────────────────┤
+// │  Phase 2: 本地拓扑探测（只看当前节点上的 GPU）                          │
+// │    ncclTopoGetSystem()：读 /sys/bus/pci，构建 GPU/NIC/CPU/Switch 拓扑图 │
+// │    ncclTopoComputePaths()：计算 GPU-GPU / GPU-NIC 路径（NVLink/PCIe）   │
+// │    ncclTopoTrimSystem()：删掉不可达 GPU 和无用 NIC                      │
+// │    ncclNvlsInit()：检查 NVLink SHARP（NVLS）是否可用                    │
+// ├─────────────────────────────────────────────────────────────────────────┤
+// │  Phase 3: 图搜索（找到最优 Ring/Tree/CollNet/NVLS 拓扑路径）            │
+// │    ncclTopoCompute(ringGraph)：搜索 Ring 路径（每条 channel 对应 1 ring）│
+// │    ncclTopoCompute(treeGraph)：搜索 Tree 路径（与 ring channel 数相同）  │
+// │    ncclTopoCompute(collNetChainGraph/Direct)：如果 CollNet 可用         │
+// │    ncclTopoCompute(nvlsGraph)：如果 NVLS 可用                          │
+// │    图搜索结果：每个算法有 nChannels/bwIntra/bwInter/typeIntra/typeInter  │
+// ├─────────────────────────────────────────────────────────────────────────┤
+// │  Phase 4: AllGather3 - 交换图搜索结果（graphInfo + topoRanks）          │
+// │    每个 rank 广播自己的图搜索结果（bw/channel数等），对齐取 min/max      │
+// │    ncclTopoPreset()：预设各 channel 的 ring/tree 收发方向               │
+// │    ncclTopoPostset()：综合所有 rank 的 topoRanks，生成最终 ring 序列    │
+// ├─────────────────────────────────────────────────────────────────────────┤
+// │  Phase 5: 建立传输连接                                                  │
+// │    ncclTransportRingConnect()：建立 ring 的 send/recv buffer 连接       │
+// │    ncclTransportTreeConnect()：建立 tree 的 send/recv 连接              │
+// │    ncclTransportPatConnect()：PAT 算法连接（仅 1 GPU/node 时）          │
+// │    ncclNvlsSetup() + ncclNvlsBufferSetup()：设置 NVLS 多播内存         │
+// │    ncclCollNetSetup()：设置 CollNet（如果可用）                         │
+// │    ncclProxyCreate()：启动 proxy 服务线程                               │
+// │    ncclProxyConnect()：rank 连接到本地 proxy 线程                       │
+// ├─────────────────────────────────────────────────────────────────────────┤
+// │  Phase 6: 算法调优 + 对称内存支持检测                                   │
+// │    ncclTopoTuneModel()：为每种 algo/proto/size 组合计算最优性能估算     │
+// │    symmetricSupport 判断：isAllCudaP2p && cuMem && GIN或全NVLink集群    │
+// │    devCommSetup()：把 comm 状态镜像到 GPU memory（ncclKernelComm）      │
+// └─────────────────────────────────────────────────────────────────────────┘
+// ============================================================================
 static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* parent, uint64_t timers[TIMERS_INIT_COUNT]) {
   // We use 2 AllGathers
   // 1. { peerInfo, comm, compCap}
@@ -996,12 +1146,26 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   timers[TIMER_INIT_ALLGATHER] = clockNano();
   // AllGather1 - begin
+  // ──────────────────────────────────────────────────────────────────────────
+  // AllGather1：交换 peerInfo，让所有 rank 相互了解
+  // peerInfo[nranks+1]：多分配 1 个槽位给 CollNet 虚拟 root rank
+  // fillInfo()：填充本 rank 的设备信息（busId/compCap/hostHash/MNNVL fabricInfo/
+  //             gdrSupport/GIN type/RMA plugin 是否可用 等）
+  // bootstrapAllGather()：通过 bootstrap TCP 网络执行 AllGather，所有 rank 互换 peerInfo
+  // 完成后 comm->peerInfo[i] 包含 rank i 的所有基本信息
+  // ──────────────────────────────────────────────────────────────────────────
   NCCLCHECKGOTO(ncclCalloc(&comm->peerInfo, nranks+1), ret, fail); // Extra rank to represent CollNet root
   NCCLCHECKGOTO(fillInfo(comm, comm->peerInfo+rank, comm->commHash), ret, fail);
   NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, comm->peerInfo, sizeof(struct ncclPeerInfo)), ret, fail);
   COMPILER_ATOMIC_STORE(&comm->peerInfoValid, true, std::memory_order_release);
 
   comm->cuMemSupport = 1;
+  // 遍历所有 rank 的 peerInfo，做全局协商：
+  // - 版本检查：所有 rank 必须是同一个 NCCL 版本
+  // - 重复 GPU 检查：同一台机器上不能有两个 rank 用同一块 GPU
+  // - globalGinSupport：所有 rank 都必须支持相同 GIN type 才能启用 GIN
+  // - globalCrossNicSupport：是否所有 rank 都支持跨 NIC（用于判断 GIN FULL vs RAIL）
+  // - globalCuMemGdrSupport：是否所有 rank 都支持 cuMem + GDR（GIN 必须的）
   for (int i = 0; i < nranks; i++) {
     if (comm->peerInfo[i].version != comm->peerInfo[rank].version) {
       WARN("Mismatched NCCL version detected : rank %d version %d rank %d version %d",
@@ -1017,6 +1181,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     globalCuMemGdrSupport &= comm->peerInfo[i].cuMemGdrSupport;
   }
   // AllGather1 - end
+  // AllGather1 结束：至此每个 rank 已知道所有其他 rank 的设备特性
   timers[TIMER_INIT_ALLGATHER] = clockNano() - timers[TIMER_INIT_ALLGATHER];
 
   // Check for MNNVL support
@@ -1082,6 +1247,9 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   timers[TIMER_INIT_TOPO] = clockNano();
 
   // Dump XML if requested by user
+  // ──────────────────────────────────────────────────────────────────────────
+  // 本地拓扑探测（只探测当前节点，不需要跨节点通信）
+  // ──────────────────────────────────────────────────────────────────────────
   const char* dumpXmlFile;
   dumpXmlFile = ncclGetEnv("NCCL_TOPO_DUMP_FILE");
   if (dumpXmlFile) {
@@ -1089,10 +1257,17 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
 
   // Topo detection / System graph creation
+  // ncclTopoGetSystem：读取 /sys/bus/pci，构建本节点的 GPU/NIC/CPU/Switch 拓扑图
+  //   结果是一棵树：CPU → PCIe Switch → GPU/NIC/... 各节点含连接类型（NVLink/PCIe/等）
+  //   MNNVL 信息也在这里注入（跨节点 NVLink fabric 的 UUID/cliqueId）
   NCCLCHECKGOTO(ncclTopoGetSystem(comm, &comm->topo), ret, fail);
   // Compute paths between GPUs and NICs
+  // ncclTopoComputePaths：BFS 遍历拓扑图，为每个 GPU-GPU/GPU-NIC 对计算路径
+  //   路径包含：类型（NVLink/NVLINK+PCIe/PCIe/etc）、带宽、hop count
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
   // Remove inaccessible GPUs and unused NICs
+  // ncclTopoTrimSystem：删除当前 comm 不涉及的 GPU（其他 comm 的 GPU）和无用 NIC
+  //   目的是让 NCCL 在搜索拓扑时只考虑"自己的" GPU
   NCCLCHECKGOTO(ncclTopoTrimSystem(comm->topo, comm), ret, fail);
   // Recompute paths after trimming
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
@@ -1137,6 +1312,14 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   timers[TIMER_INIT_GRAPHS] = clockNano();
   // Get rings and trees
+  // ──────────────────────────────────────────────────────────────────────────
+  // 图搜索（Graph Search）：为每种算法找到本节点的最优通信路径
+  // 每个 ncclTopoGraph 对应一种算法，search 的目标是：
+  //   在满足 minChannels/maxChannels 约束的前提下，找到带宽最大的通路组合
+  // 搜索完成后图中记录：nChannels / bwIntra / bwInter / typeIntra / typeInter
+  // ──────────────────────────────────────────────────────────────────────────
+  // Ring 图：环形路径，每条 channel 构成一个完整的环
+  //   maxChannels = MAXCHANNELS/2 是因为每个 ring 要占用 2 条传输线路（send/recv 各一）
   memset(ringGraph, 0, sizeof(struct ncclTopoGraph));
   ringGraph->id = 0;
   ringGraph->pattern = NCCL_TOPO_PATTERN_RING;
@@ -1145,6 +1328,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   NCCLCHECKGOTO(ncclTopoCompute(comm->topo, ringGraph), ret, fail);
   NCCLCHECKGOTO(ncclTopoPrintGraph(comm->topo, ringGraph), ret, fail);
 
+  // Tree 图：双二叉树（balanced tree），channel 数与 ring 相同
+  //   同一套 channel 基础设施同时承载 ring 和 tree，节省资源
   memset(treeGraph, 0, sizeof(struct ncclTopoGraph));
   treeGraph->id = 1;
   treeGraph->pattern = NCCL_TOPO_PATTERN_BALANCED_TREE;
@@ -1153,6 +1338,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   NCCLCHECKGOTO(ncclTopoCompute(comm->topo, treeGraph), ret, fail);
   NCCLCHECKGOTO(ncclTopoPrintGraph(comm->topo, treeGraph), ret, fail);
 
+  // CollNet Chain 图：IB Switch 上的 reduce（链式聚合），需要 NCCL_COLLNET_ENABLE=1
+  //   依赖网络侧的 SHARP/CollNet 能力，只有少数高端 IB 集群支持
   memset(collNetChainGraph, 0, sizeof(struct ncclTopoGraph));
   collNetChainGraph->id = 2;
   collNetChainGraph->pattern = NCCL_TOPO_PATTERN_TREE;
@@ -1160,6 +1347,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   collNetChainGraph->minChannels = ringGraph->nChannels;
   collNetChainGraph->maxChannels = ringGraph->nChannels;
 
+  // CollNet Direct 图：IB Switch 上的 AllGather/Broadcast（直连）
   memset(collNetDirectGraph, 0, sizeof(struct ncclTopoGraph));
   collNetDirectGraph->id = 4;
   collNetDirectGraph->pattern = NCCL_TOPO_PATTERN_COLLNET_DIRECT;
@@ -1173,6 +1361,9 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     NCCLCHECKGOTO(ncclTopoPrintGraph(comm->topo, collNetDirectGraph), ret, fail);
   }
 
+  // NVLS 图：NVLink SHARP（NVSwitch 片上 reduce）
+  //   nvlsSupport 由 ncclNvlsInit() 在拓扑探测后判断
+  //   必须满足：SM90+、NVSwitch、所有 GPU 都在 NVSwitch 域内
   memset(nvlsGraph, 0, sizeof(struct ncclTopoGraph));
   nvlsGraph->id = 3;
   nvlsGraph->pattern = NCCL_TOPO_PATTERN_NVLS;
@@ -1202,6 +1393,11 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   // Because timers[[TIMER_INIT_ALLGATHER] already contains the timing of the first allgather,
   // we temporarily store the start time of the subsequent one in an as-of-yet unused CONNECT timer.
+  // ──────────────────────────────────────────────────────────────────────────
+  // AllGather3：交换图搜索结果 + topoRanks，完成全局对齐
+  // 每个 rank 本地搜索到的 nChannels/bw 可能不同，需要对齐取 min（木桶效应）
+  // topoRanks：每个 rank 在 ring/tree 中的邻居关系（ringRecv/ringSend/treeUp/Down）
+  // ──────────────────────────────────────────────────────────────────────────
   timers[TIMER_INIT_CONNECT] = clockNano();
   // AllGather3 - begin
   NCCLCHECKGOTO(ncclCalloc(&allGather3Data, nranks), ret, fail);
@@ -1238,8 +1434,12 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   NCCLCHECKGOTO(ncclTopoGetMinNetBw(comm->topo, comm->rank, &allGather3Data[rank].minNetBw), ret, fail);
 
   comm->nChannels = std::min(treeGraph->nChannels, ringGraph->nChannels);
+  // ncclTopoPreset()：根据本地拓扑图，为每个 channel 设定 ring/tree 的收发方向
+  //   填充 topoRanks.ringRecv/ringSend/treeUp/treeDown 等字段
+  //   这些信息在 AllGather3 后被 ncclTopoPostset() 用于最终确定全局 ring 顺序
   NCCLCHECKGOTO(ncclTopoPreset(comm, graphs, &allGather3Data[rank].topoRanks), ret, fail);
 
+  // 执行第二次 AllGather，交换所有 rank 的图搜索结果和 topoRanks
   NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allGather3Data, sizeof(*allGather3Data)), ret, fail);
 
   // Determine nNodes, firstRanks, ...
@@ -1430,8 +1630,13 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   comm->isOneRPN = (comm->maxLocalRanks == 1);
 
   NCCLCHECKGOTO(ncclCalloc(&rings, nranks*MAXCHANNELS), ret, fail);
+  // ncclTopoPostset()：综合所有 rank 的 topoRanks 信息，生成最终的 ring 顺序数组
+  //   rings[channel * nranks + i] = ring 中位置 i 的 rank
+  //   同时设置 tree.up/tree.down[]，确定每个 channel 的树形结构
+  //   这是让各 rank 就"我和谁相邻"达成共识的最后一步
   NCCLCHECKGOTO(ncclTopoPostset(comm, nodesFirstRank, nodesTreePatterns, allTopoRanks, rings, graphs, parent), ret, fail);
   // AllGather3 - end
+  // AllGather3 结束：至此所有 rank 知道 ring/tree 的全局顺序
   timers[TIMER_INIT_ALLGATHER] += clockNano() - timers[TIMER_INIT_CONNECT];
 
   TRACE(NCCL_INIT, "rank %d nranks %d - BUILT %d TREES/RINGS", rank, nranks, comm->nChannels);
@@ -1453,6 +1658,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   /* until now, all info of comm should be known. We can initialize shared resources and
    * map localRanks to top parent local ranks. NOTE: this shareRes init must be put before
    * all proxy operations. */
+  // 此时 comm 的所有信息已知，将关键信息写入 sharedRes（仅 owner comm 写，split comm 复用）
+  // sharedRes->tpNChannels = comm->nChannels 等字段被所有共享 sharedRes 的 comm 读取
   if (comm->sharedRes->owner == comm) {
     comm->sharedRes->tpNLocalRanks = comm->localRanks;
     comm->sharedRes->magic = comm->magic;
@@ -1472,6 +1679,14 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   NCCLCHECKGOTO(ncclTransportCheckP2pType(comm, &comm->isAllDirectP2p, &comm->directMode, &comm->isAllCudaP2p), ret, fail);
   // Launch proxy service thread, after this, the proxy calls can be used.
+  // ──────────────────────────────────────────────────────────────────────────
+  // 启动 proxy 服务线程
+  // proxy 线程的作用：作为 GPU kernel 和 IB 网络之间的中间人
+  //   GPU kernel 通过 proxyOp 队列向 proxy 线程发送 RDMA 操作请求
+  //   proxy 线程轮询队列，调用 net->iSend/iRecv/test 执行实际的网络操作
+  // 如果是 splitShare 的子 comm，则复用父 comm 的 proxy 线程（引用计数 +1）
+  // GIN_PROXY 后端也在 proxy 线程里做 CPU 侧的 GFD → IB 转发（见 gin_host_proxy.cc）
+  // ──────────────────────────────────────────────────────────────────────────
   if (parent && parent->shareResources) {
     comm->proxyState = parent->sharedRes->proxyState;
     ncclAtomicRefCountIncrement(&parent->sharedRes->proxyState->refCount);
@@ -1482,6 +1697,11 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   timers[TIMER_INIT_CONNECT] = clockNano();
   // Build p2p schedule
+  // P2P 调度表：每个 rank 需要与哪些 rank 做 P2P 通信（AllToAll 场景下用到）
+  // 使用二次探测（quadratic formula）生成尽量均匀的 P2P 顺序，减少 hotspot
+  // ──────────────────────────────────────────────────────────────────────────
+  // 建立传输连接（Connect Phase）
+  // ──────────────────────────────────────────────────────────────────────────
   comm->p2pSchedule = ncclMemoryStackAlloc<ncclComm::P2pSchedulePair>(&comm->memPermanent, comm->nRanks);
   comm->planner.peers = ncclMemoryStackAlloc<ncclKernelPlanner::Peer>(&comm->memPermanent, comm->nRanks);
   NCCLCHECK(ncclP2pSchedule(comm));
@@ -1498,12 +1718,23 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     comm->planner.rmaTaskQueues = NULL;
   }
 
+  // runtimeConn：是否延迟连接（lazy connect），仅在第一次实际用到时才建立传输连接
+  //   条件：cuMemSupport（VMM 可用）且 NCCL_RUNTIME_CONNECT=1
+  //   优点：加速 init，减少不必要的连接建立（特别是 P2P 场景中用不到的 peer 对）
+  //   延迟连接的实际触发在 enqueue.cc 的 ncclPrepareTasks() 中
   comm->runtimeConn = comm->cuMemSupport && ncclParamRuntimeConnect();
   if (comm->runtimeConn) {
+    // 立即连接模式：init 阶段就建立所有 ring/tree/PAT/NVLS/CollNet 的传输连接
+    // 延迟连接模式：只设置 channel 的 ring/tree 结构，不立即建立传输连接
+    // 实际 connect 延迟到第一次使用该 peer 对时（见 ncclTransportRuntimeConnect）
     for (int c=0; c<comm->nChannels; c++) {
       NCCLCHECKGOTO(setupChannel(comm, c, rank, nranks, rings+c*nranks), ret, fail);
     }
     // Attempt to setup NVLS
+    // ncclNvlsSetup：设置 NVLink SHARP 多播内存
+    //   在 NVSwitch 侧创建 multicast handle，各 GPU 注册进该 handle
+    //   这样一次写操作可以广播给所有 GPU（用于 AllReduce/AllGather 的 NVSwitch reduce）
+    // ncclNvlsBufferSetup：为每个 channel 分配 NVLS scratch buffer
     NCCLCHECKGOTO(ncclNvlsSetup(comm, parent), ret, fail);
     // Check if we can setup CollNet
     if (comm->config.collnetEnable) ncclCollNetSetup(comm, parent, graphs);
@@ -1511,12 +1742,20 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     for (int c=0; c<comm->nChannels; c++) {
       NCCLCHECKGOTO(setupChannel(comm, c, rank, nranks, rings+c*nranks), ret, fail);
     }
+    // ncclTransportRingConnect：为所有 ring channel 的 send/recv 建立传输连接
+    //   每个 channel：本 rank 的 ring.next 是 send peer，ring.prev 是 recv peer
+    //   连接包括：分配 GPU buffer、交换地址（通过 proxy AllGather）、RDMA 注册内存
     NCCLCHECKGOTO(ncclTransportRingConnect(comm), ret, fail);
 
     // Connect Trees
+    // ncclTransportTreeConnect：为树形 channel 建立 send/recv 连接
+    //   每个 channel：tree.up 是 parent，tree.down[] 是 children
     NCCLCHECKGOTO(ncclTransportTreeConnect(comm), ret, fail);
 
     // Connect PAT only for communicators with 1 GPU per node
+    // PAT（Pairwise Exchange Accumulate Tree）连接
+    // PAT 是一种新算法，仅在 1 GPU/node（maxLocalRanks==1）时使用
+    // 相比 Ring，PAT 在少 rank 跨节点场景下有更好的带宽利用率
     if (comm->maxLocalRanks == 1) NCCLCHECKGOTO(ncclTransportPatConnect(comm), ret, fail);
 
     // Attempt to setup NVLS
@@ -1527,6 +1766,9 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     NCCLCHECKGOTO(ncclNvlsTreeConnect(comm), ret, fail);
 
     // Check if we can setup CollNet
+    // ncclCollNetSetup：设置 IB CollNet 路径（需要 IB Switch 的 SHARP 能力）
+    //   Chain：每个节点接入树形结构，由网络侧完成跨节点 reduce
+    //   Direct：节点直接广播/聚合（更低延迟）
     if (comm->config.collnetEnable) {
       ncclCollNetSetup(comm, parent, graphs);
       NCCLCHECKGOTO(ncclCollNetChainBufferSetup(comm), ret, fail);
@@ -1536,10 +1778,15 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     }
 
     // Connect to local net proxy
+    // 每个 rank 连接到本节点的 proxy 线程，发送 SharedInit 消息
+    // SharedInit 消息通知 proxy 线程：本 comm 有多少个 P2P channel 需要服务
     NCCLCHECKGOTO(ncclProxyConnect(comm, TRANSPORT_NET, 1, comm->rank, &proxyConn), ret, fail);
     NCCLCHECKGOTO(ncclProxyCallBlocking(comm, &proxyConn, ncclProxyMsgSharedInit, &comm->p2pnChannels, sizeof(int), NULL, 0), ret, fail);
 
     // Then to remote ones when using PXN
+    // PXN（Proxy NVLink eXtended）：通过 NVLink + 本节点 IB 卡 访问远端内存
+    // 即 GPU A 用 NVLink 把数据推给同节点的 GPU B，由 B 的 IB 卡代理发送出去
+    // 这样可以避免 GPU A 绑定到 PCIe bandwidth，使用更快的 NVLink 本地传输
     if (ncclPxnDisable(comm) == 0) {
       int nranks;
       NCCLCHECKGOTO(ncclTopoGetPxnRanks(comm, &pxnPeers, &nranks), ret, fail);
@@ -1551,6 +1798,9 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
     if (ncclParamNvbPreconnect()) {
       // Connect p2p when using NVB path
+      // NVB（NVLink Bridged）P2P 预连接
+      // 对于通过 NVLink 间接连接的 GPU，在 init 时就预建立 P2P 传输连接
+      // 而不是等到第一次 P2P 操作时才建立（避免首次延迟）
       int nvbNpeers;
       NCCLCHECKGOTO(ncclTopoGetNvbGpus(comm->topo, comm->rank, &nvbNpeers, &nvbPeers), ret, fail);
       for (int r=0; r<nvbNpeers; r++) {
@@ -1580,6 +1830,16 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   TRACE(NCCL_INIT, "rank %d nranks %d - CONNECTED %d RINGS AND TREES", rank, nranks, comm->nChannels);
 
   // Compute time models for algorithm and protocol combinations
+  // ──────────────────────────────────────────────────────────────────────────
+  // 算法调优（Tuning）
+  // ──────────────────────────────────────────────────────────────────────────
+  // ncclTopoInitTunerConstants()：根据拓扑图计算 tuner 用到的基础参数
+  //   包括：带宽、延迟、NVLink hop 数、IB 跳数等
+  // ncclTunerPluginLoad()：加载外部 tuner 插件（如果有 NCCL_TUNER_PLUGIN）
+  //   允许用户/集群管理员提供自定义的算法选择策略
+  // ncclTopoTuneModel()：为所有 (algo, proto, msgsize) 组合预计算性能模型
+  //   结果存入 comm->bandwidths[] / comm->latencies[]，供 enqueue 时查表
+  //   这就是 NCCL 自动选择 Ring/Tree/NVLS 的依据
   NCCLCHECKGOTO(ncclTopoInitTunerConstants(comm), ret, fail);
   NCCLCHECKGOTO(ncclTunerPluginLoad(comm), ret, fail);
   if (comm->tuner) {
@@ -1605,11 +1865,19 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     }
   }
 
+  // ──────────────────────────────────────────────────────────────────────────
+  // Symmetric Memory（对称内存）支持检测
+  // ──────────────────────────────────────────────────────────────────────────
+  // GIN 连接类型最终判定：
+  //   FULL：所有 rank 都支持 GIN，且所有 NIC 都可以 crossNic（任意 GPU 用任意 NIC）
+  //   RAIL：支持 GIN 但 NIC 不能 crossNic（每个 GPU 只能用固定的 rail NIC）
+  //   NONE：有 rank 不支持 GIN，或 NIC 已 fused，或 cuMemGdr 不可用
   NCCLCHECKGOTO(ncclTopoPathAllDirectNVLink(comm->topo, &comm->isAllDirectNvlink), ret, fail);
   comm->globalGinSupport = NCCL_GIN_CONNECTION_NONE;
   if (globalGinSupport && !globalNicFused && globalCuMemGdrSupport) {
     comm->globalGinSupport = globalCrossNicSupport ? NCCL_GIN_CONNECTION_FULL : NCCL_GIN_CONNECTION_RAIL;
   }
+  // globalRmaProxySupport：全局 RMA proxy 支持（所有 rank 都有 RMA 插件 + 合适的网络拓扑）
   comm->globalRmaProxySupport = globalRmaPluginSupport && globalCrossNicSupport && !globalNicFused && globalCuMemGdrSupport;
   isOneLsaTeams = ncclDevrIsOneLsaTeam(comm);
   comm->symmetricSupport = comm->isAllCudaP2p && ncclParamWinEnable() && ncclCuMemEnable() && (comm->globalGinSupport != NCCL_GIN_CONNECTION_NONE || isOneLsaTeams);
@@ -1624,6 +1892,10 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   // Call devCommSetup before the last barrier, making sure we don't have a thread running in front and starting to
   // launch NCCL kernels before all cuda mem allocation is complete. That could cause a deadlock.
+  // devCommSetup()：将 host comm 状态同步到 GPU 设备内存
+  //   创建 GPU 上的 ncclKernelComm 结构，包含 rank/nRanks/channels[]/abortFlag 等
+  //   此后 NCCL kernel 就可以直接从 GPU memory 读取通信所需的一切信息
+  // 必须在 barrier 之前调用：确保所有 CUDA 内存分配完成，防止 kernel 提前启动导致死锁
   NCCLCHECKGOTO(devCommSetup(comm), ret, fail);
 
   timers[TIMER_INIT_CONNECT] = clockNano() -  timers[TIMER_INIT_CONNECT];
@@ -1759,6 +2031,30 @@ static ncclResult_t getParentRanks(int parentRanks, int parentRank, int* exclude
   return ncclSuccess;
 }
 
+// ============================================================================
+// ncclCommInitRankFunc()：异步 job 的实际执行入口，覆盖 ncclCommInitRank/Split/Grow/Shrink 逐预冗
+//
+// NCCL 初始化全流程：
+//   ncclCommInitRank()、ncclCommSplit()、ncclCommGrow()、ncclCommShrink()
+//   ↓ 均通过 ncclAsyncJob 技制异步执行
+//   ncclCommInitRankFunc()
+//   ↓
+//   +--- 1. 初始化 GPU 设备 (cudaSetDevice)
+//   +--- 2. ncclInitKernelsForDevice()：初始化该设备的所有 NCCL kernel
+//   |       加载并设置所有 kernel 函数的 shared memory 配置
+//   +--- 3. commAlloc()：分配并基础初始化 ncclComm 结构体
+//   |       创建 sharedRes / 加载网络插件 / 创建 CUDA 内存管理器
+//   +--- 4. bootstrapInit()/bootstrapSplit()：建立 rank 间的 bootstrap 通信信道
+//   |       所有 rank 互知相手，建立 1:1 TCP 连接用于后续 init 控制消息
+//   +--- 5. initTransportsRank()：核心初始化（上面详细注释的函数）
+//   |       AllGather1 → 拓扑探测 → 图搜索 → AllGather3 → 连接建立 → devCommSetup
+//   +--- 6. 调功：更新 comm->initState = ncclSuccess
+//
+// SPLIT 路径与普通 INIT 的主要差异：
+//   - 使用 bootstrapSplit() 而非 bootstrapInit()：复用父 comm 的 bootstrap
+//   - commHash 由父 comm hash + childCount + color 计算，确保全局唯一
+//   - shareResources=true 时：子 comm 共享父 comm 的 proxy/stream/sharedRes
+// ============================================================================
 static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   struct ncclCommInitRankAsyncJob* job = (struct ncclCommInitRankAsyncJob*)job_;
   ncclComm_t comm = job->comm;
@@ -1774,6 +2070,8 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   unsigned long long commIdHash;
 
   timers[TIMER_INIT_TOTAL] = clockNano();
+  // 获取 CUDA 设备基本信息：计算能力、最大共享内存
+  // cudaArch = major*100 + minor*10，例如 SM90 对应 900，SM80 对应 800
   CUDACHECKGOTO(cudaSetDevice(cudaDev), res, fail);
   CUDACHECKGOTO(cudaDeviceGetAttribute(&maxSharedMem, cudaDevAttrMaxSharedMemoryPerBlockOptin, cudaDev), res, fail);
   CUDACHECKGOTO(cudaDeviceGetAttribute(&archMajor, cudaDevAttrComputeCapabilityMajor, cudaDev), res, fail);
@@ -1781,6 +2079,10 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   cudaArch = 100*archMajor + 10*archMinor;
 
   timers[TIMER_INIT_KERNELS] = clockNano();
+  // ncclInitKernelsForDevice()：为当前设备导入所有 NCCL kernel
+  // NCCL kernel 按 (func, algo, proto, SM_arch) 组合编译成多个函数实例
+  // 这里做的事：设置每个 kernel 函数的 maxDynamicSharedSizeBytes
+  //   这样 kernel 可以尽可能利用更大的 shared memory
   NCCLCHECK(ncclInitKernelsForDevice(cudaArch, maxSharedMem, &maxLocalSizeBytes));
   // Set the maximum kernel stack size of all kernels to avoid
   // a CUDA memory reconfig on load (c.f. NVSHMEM issue)
@@ -1792,6 +2094,15 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
 
   if (job->parent && !job->isGrow) {
     // SPLIT/SHRINK: use bootstrapSplit
+    // 路径 A：SPLIT 或 SHRINK 操作
+    //
+    // bootstrapSplit()：基于父 comm 的 bootstrap channel
+    //   使用父 comm 的已建立 TCP 连接，不需要重新建立物理连接
+    //   递递交換 → 计算子 comm 的 rank/nRanks/parentRanks[] 映射
+    //
+    // commAlloc(parent) 的差异：
+    //   如果 shareResources=1：子 comm 共享父 comm 的 sharedRes（引用计数 +1）
+    //   如果 shareResources=0：创建全新的 sharedRes（独立 proxy/stream/GIN）
     NCCLCHECKGOTO(ncclCalloc(&parentRanks, job->parent->nRanks), res, fail);
     if (job->excludeRanksCount) {
       NCCLCHECKGOTO(getParentRanks(job->parent->nRanks, job->parent->rank, job->excludeRanksList, job->excludeRanksCount, &job->nranks, &job->myrank, parentRanks), res, fail);
@@ -1819,6 +2130,11 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     commIdHash = 0;
   } else {
     // GROW or NORMAL INIT: use bootstrapInit
+    // 路径 B：GROW 或普通 INIT
+    //
+    // bootstrapInit()：所有 rank 通过 UniqueId 中嵌入的地址连接到 bootstrap 服务器
+    //   流程：rank 0 监听 TCP 端口 → 其他 rank 连接 → 互交地址 → 建立 N*N 全连接表
+    //   bootstrap 完成后，每对 rank 间都有对应的 TCP socket 可用
     if (job->isGrow) {
       struct ncclBootstrapHandle* growHandle = (struct ncclBootstrapHandle*)job->commId;
       uint64_t baseMagic = growHandle ? growHandle->magic : hashCombine(job->parent->magic, job->parent->childCount);

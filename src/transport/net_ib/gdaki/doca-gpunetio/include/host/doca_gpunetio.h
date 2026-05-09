@@ -75,23 +75,41 @@ struct doca_gpu_dev_verbs_cq;
 /**
  * @brief GPUNetIO QP handler accessible from CPU
  *
+ * CPU proxy 机制的核心数据结构。
+ * 当 GPU 无法直接敲 NIC Doorbell 时，GPU 把 Producer Index 写入 cpu_db，
+ * CPU proxy 线程从 cpu_db 读取后，通过 sq_db 代劳敲 NIC 的 UAR Doorbell。
+ *
+ * 两种 cpu_proxy=true 的场景：
+ *   1. Full Assisted（完整代劳）：GPU 完全无法访问 UAR
+ *      → cpu_db = 独立分配的 CPU-GPU 共享 8 字节
+ *      → nic_handler = CPU_PROXY
+ *   2. DBR Assisted（DBR 辅助）：GPU 能敲 DB 但硬件不支持 DBR
+ *      → cpu_db = qp_gpu_h->sq_wqe_pi（通过 GDRCopy 映射的 GPU 内存）
+ *      → send_dbr_mode_ext = NO_DBR_SW_EMULATED
+ *      → CPU 负责写 DBR + 敲 DB（GPU 只写 WQE + 更新 PI）
  */
 struct doca_gpu_verbs_qp {
-    struct doca_gpu *gpu_dev;
-    struct doca_verbs_qp *qp;
-    uint64_t *cpu_db;
-    uint64_t sq_wqe_pi_last;
-    uint64_t *sq_db;
-    __be32 *sq_dbrec;
-    bool cpu_proxy;
-    uint32_t sq_num_shift8_be;
-    enum doca_gpu_verbs_send_dbr_mode_ext send_dbr_mode_ext;
+    struct doca_gpu *gpu_dev;   // 所属 GPU 设备
+    struct doca_verbs_qp *qp;  // 底层 Verbs QP 句柄
+    uint64_t *cpu_db;          // CPU-GPU 共享的 Doorbell 值指针
+                               //   GPU 写入新的 Producer Index（sq_wqe_pi）
+                               //   CPU proxy 原子读取后代敲 NIC Doorbell
+    uint64_t sq_wqe_pi_last;   // CPU proxy 上次看到的 PI 值
+                               //   与 cpu_db 比较判断是否有新 WQE
+    uint64_t *sq_db;           // NIC UAR Doorbell 寄存器地址（MMIO 映射）
+                               //   CPU proxy 通过原子 store 向此地址写入 ctrl_seg 来敲 DB
+    __be32 *sq_dbrec;          // Doorbell Record 地址（NIC 内存）
+                               //   某些模式下 NIC 恢复时需要读 DBR 而非依赖 DB 中断
+    bool cpu_proxy;            // 是否启用 CPU proxy 模式
+    uint32_t sq_num_shift8_be; // QPN << 8 的大端表示，用于构造 Doorbell ctrl_seg
+    enum doca_gpu_verbs_send_dbr_mode_ext send_dbr_mode_ext;  // DBR 模式
 
-    /* CPU handler */
+    /* CPU handler：CPU 侧填充的 QP 运行时结构，用于 H2D 拷贝到 GPU */
     struct doca_gpu_dev_verbs_qp *qp_cpu;
-    /* GPU handler */
+    /* GPU handler：GPU 显存中的 QP 结构（qp_cpu 拷贝过去的） */
     struct doca_gpu_dev_verbs_qp *qp_gpu;
-    /* CPU-accessible GPU handler. Linked with qp_gpu via GDRCopy. */
+    /* CPU-accessible GPU handler：通过 GDRCopy 映射 qp_gpu，
+     * 使 CPU 可直接读写 GPU 显存中的 QP 字段（如 sq_wqe_pi） */
     struct doca_gpu_dev_verbs_qp *qp_gpu_h;
 };
 

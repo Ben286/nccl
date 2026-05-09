@@ -226,6 +226,7 @@ ncclResult_t ncclGinIbConnect(void *ctx, void *handles[], int nranks, int rank,
   cComm->nranks = nranks;
   cComm->rank = rank;
 
+    // 向 rank+1 发起连接，接受 rank-1 的连接，构成 ring
   next = (cComm->rank + 1) % nranks;
   do
   {
@@ -383,6 +384,18 @@ ncclResult_t ncclGinIbProxyGetProperties(int dev, ncclNetProperties_t* props) {
   return ncclSuccess;
 }
 
+// =========================================================================
+// GIN Proxy Init 阶段 —— 第一步：建立控制面 Ring 拓扑
+// =========================================================================
+// 调用共享的 ncclGinIbConnect 建立单向 Ring：
+//   rank → (rank+1)%nranks 为 sendComm
+//   (rank-1+nranks)%nranks → rank 为 recvComm
+// 这个 Ring 仅用于 init 阶段的控制面集合操作（allGather/allToAll），
+// 例如：交换 listen handle、同步 MR 的 base_va 和 rkey 等。
+// 产出物：ncclGinIbCollComm，包含 ring 上的 send/recv comm + allGather/allToAll 函数指针。
+//
+// 注意：这里传 gdaki=false，proxy 模式不使用 DOCA GPUNetIO，
+// 只需标准的 peer_mem 或 DMA-BUF 来实现 GDR（GPU Direct RDMA）。
 ncclResult_t ncclGinIbProxyConnect(void *ctx, void *handles[], int nranks, int rank,
                                    void *listenComm, void **collComm) {
   // Check the current GPU supports GDR
@@ -395,13 +408,40 @@ ncclResult_t ncclGinIbProxyConnect(void *ctx, void *handles[], int nranks, int r
   return ncclSuccess;
 }
 
+// IB 后端 context —— Proxy 模式的最底层数据面连接状态
+// 与 gin_host_proxy.cc 中的 ginProxyCtx（中间层 proxy context）不同：
+//   - ginProxyCtx：存储 GFD 队列、计数器、信号等 GPU↔CPU 通信资源
+//   - ncclGinIbProxyCtx：存储 full-mesh IB QP 连接，供 iput/iget/iflush 使用
+//
+// 内存布局：分配为 ncclGinIbProxyCtx[nContexts] 数组，
+//   ginProxyCtx[0].nContexts 记录总数（其余元素不重复存储）。
+// runtime 时通过 ginCtx[context] 索引到对应 context 的连接集。
 struct ncclGinIbProxyCtx {
-  void**        fullRecvComm;
-  void**        fullSendComm;
-  int rank, nranks;
-  int nContexts;
+  void**        fullRecvComm;  // [nranks] 到每个 rank 的接收 comm（用于 iflush 的 RDMA Read）
+  void**        fullSendComm;  // [nranks] 到每个 rank 的发送 comm（用于 iput/iget 的 RDMA Write/Read）
+  int rank, nranks;            // 本 rank 编号和总 rank 数
+  int nContexts;               // context 总数（仅 [0] 有效）
 };
 
+// =========================================================================
+// GIN Proxy Init 阶段 —— 第二步：建立数据面 Full-Mesh 拓扑
+// =========================================================================
+// 为每个 context 创建到所有 rank 的 IB send + recv 连接对（全连接网络）。
+// 这些连接是 runtime 阶段 CPU proxy 线程发起 RDMA 操作的实际通路：
+//   - fullSendComm[rank] → 用于 iput（RDMA Write）和 iget（RDMA Read）
+//   - fullRecvComm[rank] → 用于 iflush（需要 recvComm 上的 gpuFlush QP）
+//
+// 连接建立策略（避免 N 个 rank 同时 connect 同一 peer 导致死锁）：
+//   迭代 i = 0..nranks-1：
+//     - rank 向 (rank+i)%nranks 发起 connect（建立 sendComm）
+//     - 同时 accept 来自 (rank-i)%nranks 的连接（建立 recvComm）
+//     - 每对连接建立后做一次 P2P Barrier 同步
+//   这保证在每轮 i 中，每个 rank 恰好发起一个 connect + accept 一个连接，
+//   不会出现多个 rank 同时等待同一 peer accept 的死锁。
+//
+// 注意：proxy 模式不支持自定义 queueDepth（GFD 队列深度由上层 gin_host_proxy 管理）。
+// devHandle 输出为 NULL —— proxy 模式不提供 GPU device handle，
+// GPU 侧资源由上层 ncclGinProxyInit（gin_host_proxy.cc）单独分配。
 ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* config, void** ginCtx, ncclNetDeviceHandle_v11_t** devHandle) {
   ncclResult_t ret = ncclSuccess;
   struct ncclGinIbCollComm *cComm = (struct ncclGinIbCollComm *)collComm;
@@ -413,6 +453,7 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
     return ncclInvalidUsage;
   }
 
+  // --- Step 1: 分配 ncclGinIbProxyCtx[nContexts] 数组 ---
   int nranks;
   struct ncclGinIbProxyCtx* ginProxyCtx = NULL;
   *ginCtx = NULL;
@@ -420,6 +461,7 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
   ginProxyCtx[0].nContexts = config->nContexts;
   ginProxyCtx[0].nranks = nranks = cComm->nranks;
 
+  // --- Step 2: 创建新的 listen 端口，通过控制面 ring 的 allGather 交换所有 rank 的 handle ---
   void *lComm = NULL;
   char* handle = NULL, *handles = NULL;
   NCCLCHECKGOTO(ncclIbMalloc((void**)&handles, NCCL_NET_HANDLE_MAXSIZE*cComm->nranks), ret, end);
@@ -428,15 +470,17 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
   NCCLCHECKGOTO(ncclNetIb.listen(cComm->ctx, cComm->dev, handle, &lComm), ret, end);
   NCCLCHECKGOTO(cComm->allGather(cComm, handle, handles, NCCL_NET_HANDLE_MAXSIZE), ret, end);
 
+  // --- Step 3: 为每个 context 建立 full-mesh 连接 ---
   for (int c=0; c<config->nContexts; c++) {
     struct ncclGinIbProxyCtx* gc = ginProxyCtx+c;
     NCCLCHECKGOTO(ncclIbMalloc((void**)&gc->fullSendComm, sizeof(void *) * nranks), ret, end);
     NCCLCHECKGOTO(ncclIbMalloc((void**)&gc->fullRecvComm, sizeof(void *) * nranks), ret, end);
     gc->rank = cComm->rank;
 
+    // Full-mesh 全连接：旋转偏移策略避免死锁
     for (int i = 0; i < nranks; i++) {
-      int connectPeer = (cComm->rank + i) % nranks;
-      int acceptPeer = (cComm->rank - i + nranks) % nranks;
+      int connectPeer = (cComm->rank + i) % nranks;          // 本轮主动连接的目标 rank
+      int acceptPeer = (cComm->rank - i + nranks) % nranks;  // 本轮被动接受的来源 rank
       do {
         if (gc->fullSendComm[connectPeer] == NULL)
           NCCLCHECKGOTO(ncclNetIb.connect(cComm->ctx, cComm->dev, handles+NCCL_NET_HANDLE_MAXSIZE*connectPeer, &gc->fullSendComm[connectPeer], NULL), ret, end);
@@ -444,13 +488,13 @@ ncclResult_t ncclGinIbProxyCreateContext(void* collComm, ncclGinConfig_v13_t* co
           NCCLCHECKGOTO(ncclNetIb.accept(lComm, &gc->fullRecvComm[acceptPeer], NULL), ret, end);
       } while ((gc->fullSendComm[connectPeer] == NULL) ||
           (gc->fullRecvComm[acceptPeer] == NULL));
-      NCCLCHECKGOTO(ncclGinIbP2PBarrier(cComm), ret, end);
+      NCCLCHECKGOTO(ncclGinIbP2PBarrier(cComm), ret, end);   // 确保所有 rank 本轮连接完成后再进入下一轮
     }
   }
 
 end:
   free(handles);
-  if (lComm) ncclNetIb.closeListen(lComm);
+  if (lComm) ncclNetIb.closeListen(lComm);  // listen 端口仅用于 init，建完连接即关闭
   if (ret != ncclSuccess) free(ginProxyCtx);
   else *ginCtx = ginProxyCtx;
   return ret;
@@ -705,33 +749,76 @@ ncclResult_t ncclGinIbProxyIPutSignal(void *ginCtx, int context, uint64_t srcOff
   return ncclSuccess;
 }
 
+// =============================================================================
+// ncclGinIbProxyTest — 检测一个 IB 异步操作是否完成
+// =============================================================================
+// 调用链：proxyGinPollCompletions → ginBackend->test → 此函数
+//
+// 核心机制：
+//   提交 WQE 时（如 iput/iputSignal/iget/iflush），若设置了 IBV_SEND_SIGNALED，
+//   NIC 在该 WQE 执行完成后会向本地 Send CQ 写入一个 CQE（Completion Queue Entry）。
+//   本函数通过 ibv_poll_cq 从 CQ 中取出 CQE，以此判断对应 WQE 是否完成。
+//
+// events 计数器原理：
+//   req->events[devIdx] 是"该 request 在 dev devIdx 上还有多少个未完成的 CQE"的计数。
+//   每提交一个 IBV_SEND_SIGNALED 的 WQE 时，ncclIbAddEvent(req, devIdx) 会 events[devIdx]++。
+//   每收到一个 CQE 时，wcReq->events[devIdx]--。
+//   当 events[devIdx] 递减到 0，说明所有 WQE 都完成了 → done=1。
+//
+// 与 GDAKI 路径的对比：
+//   GDAKI 中 GPU 直接通过 poll_cq_at 在 GPU 端轮询 CQ，不经过 CPU；
+//   Proxy 路径中 CPU 通过 ibv_poll_cq 从 host 侧轮询 CQ，然后修改 state->done 告知上层。
+// =============================================================================
 ncclResult_t ncclGinIbProxyTest(void* collComm, void *request, int *done) {
   struct ncclIbRequest* req = (struct ncclIbRequest*)request;
   struct ncclGinIbProxyCtx* ginProxyCtx = (struct ncclGinIbProxyCtx*)req->ginProxyCtx;
-  int rank = req->iput.rank;
-  *done = 0;
+  int rank = req->iput.rank;  // 本次 IB 操作的目标 peer rank
+  *done = 0;  // 默认未完成
 
+  // === 快速路径：events[0] 已经为 0，说明之前的 poll 已经收到了所有 CQE ===
+  // 这种情况发生在：同一个 CQ 上有多个 request 的 WQE 交错完成，
+  // 上一次调用 test(reqA) 时 poll_cq 顺带收到了 reqB 的 CQE 并递减了 reqB->events[0]。
+  // 所以本次调用 test(reqB) 时，events[0] 已经为 0，无需再 poll。
   if (req->events[0] == 0) {
     *done = 1;
-    NCCLCHECK(ncclIbFreeRequest(req));
+    NCCLCHECK(ncclIbFreeRequest(req));  // 回收 request 到空闲池
     return ncclSuccess;
   }
-  int wrDone = 0;
-  struct ibv_wc wc[4];
+  int wrDone = 0;       // ibv_poll_cq 返回的本次收到的 CQE 数量
+  struct ibv_wc wc[4];  // Work Completion 数组，一次最多取 4 个 CQE
+  // ibv_wc 结构体关键字段：
+  //   wc.status  — 完成状态（IBV_WC_SUCCESS=0 表示成功）
+  //   wc.wr_id   — 提交 WQE 时设置的用户标识，这里存的是 req 在 reqs[] 数组中的索引
+  //   wc.opcode  — 完成的操作类型（RDMA_WRITE / ATOMIC 等）
 
+  // === 根据操作类型选择正确的 CQ ===
+  // 每个 peer 有独立的 QP → 独立的 Send CQ（GIN full-mesh QP 架构）。
+  // iflush 走 RecvComm 的 QP/CQ（因为 flush 本质是对本地注册内存的 RDMA Read），
+  // 其他操作（iput/iputSignal/iget）走 SendComm 的 QP/CQ。
   ncclIbNetCommBase* commBase;
   ncclIbNetCommDevBase* devBase;
   if (req->type == NCCL_NET_IB_REQ_FLUSH) {
     struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)ginProxyCtx->fullRecvComm[rank];
     commBase = &comm->base;
-    devBase = &comm->devs[0].base;
+    devBase = &comm->devs[0].base;  // devBase->cq 就是 Send CQ
   } else {
     struct ncclIbSendComm* comm = (struct ncclIbSendComm*)ginProxyCtx->fullSendComm[rank];
     commBase = &comm->base;
     devBase = &comm->devs[0].base;
   }
+
+  // === 核心：ibv_poll_cq 从 Send CQ 中非阻塞地取出 CQE ===
+  // 语义：从 devBase->cq 中最多取 4 个 CQE，填入 wc[]，实际取到的个数写入 wrDone。
+  // 非阻塞：如果 CQ 为空（没有完成的 WQE），wrDone=0 立即返回。
+  // CQE 是"破坏性读取"：取出后从 CQ 中删除，不能重复取。
+  // 注意：CQ 是 per-QP 的，但一个 CQ 可以绑定多个 QP。
+  //       这里每个 peer 有独立的 QP 和 CQ，所以 poll 只会取到发往该 peer 的 WQE 的 CQE。
   NCCLCHECK(wrap_ibv_poll_cq(devBase->cq, 4, wc, &wrDone));
+
+  // === 遍历取到的每个 CQE ===
   for (int i = 0; i < wrDone; i++) {
+    // --- 错误检查：CQE status 非 SUCCESS 表示 IB 操作失败 ---
+    // 常见错误：IBV_WC_REM_ACCESS_ERR（远端内存权限错误）、IBV_WC_RETRY_EXC_ERR（重试超时）
     if (wc[i].status != IBV_WC_SUCCESS) {
       union ncclSocketAddress addr;
       ncclSocketGetAddr(req->sock, &addr);
@@ -751,9 +838,28 @@ ncclResult_t ncclGinIbProxyTest(void* collComm, void *request, int *done) {
       return ncclRemoteError;
     }
 
+    // --- 通过 wc.wr_id 反查该 CQE 对应的 request ---
+    // 提交 WQE 时设置 wr.wr_id = req - comm->base.reqs（即 request 在 reqs[] 池中的索引）。
+    // NIC 完成后将 wr_id 原样写入 CQE，这里用 reqs + wr_id 反向定位回 request。
+    // 关键：poll_cq 取到的 CQE 可能不属于当前正在 test 的 req！
+    //   因为同一 CQ 上可能有多个 request 的 WQE 交错提交并完成。
+    //   例如 test(req3) 时可能顺带取到 req2 和 req4 的 CQE。
     struct ncclIbRequest* wcReq = commBase->reqs + wc[i].wr_id;
 
+    // --- 递减该 request 的未完成 CQE 计数 ---
+    // 场景举例（iputSignal）：
+    //   提交时：wr[0]=RDMA_WRITE(unsignaled, events 不增) + wr[1]=ATOMIC_FAA(signaled, events++)。
+    //   因此 events[0]=1，只需 1 个 CQE（来自 wr[1]）就完成。
+    //
+    // 场景举例（iput）：
+    //   提交时：wr=RDMA_WRITE(signaled, events++)。events[0]=1，1 个 CQE 即完成。
     wcReq->events[0]--;
+
+    // --- 判断当前正在 test 的 request 是否完成 ---
+    // 条件 1：wcReq == req — 这个 CQE 确实属于我们正在查询的 request
+    // 条件 2：events[0] == 0 — 该 request 所有 signaled WQE 的 CQE 都已收到
+    // 两个条件同时满足 → done=1，回收 request。
+    // 注意：即使 wcReq != req，也要递减 wcReq->events[0]（为其他 request 的 test 提前消费 CQE）。
     if (wcReq == req && wcReq->events[0] == 0) {
       *done = 1;
       NCCLCHECK(ncclIbFreeRequest(wcReq));

@@ -20,6 +20,39 @@
 ////////////////////////////////////////////////////////////////////////////////
 // ncclSymk[Foo]: Kernels built on the device API
 
+//
+// ============================================================================
+// Symmetric Kernel 系统概述
+// ============================================================================
+// "Symmetric Kernel" 指通过 ncclDevCommCreate() 创建 Device-side comm，
+// 在 GPU kernel 内直接调用 NCCL 通信原语（put/waitSignal 等）的一批 kernel。
+//
+// 与传统 NCCL kernel 的差异：
+//   传统：host 上的 ncclAllReduce() 调用 → CPU 处理，最终发射 kernel
+//   Symmetric：GPU kernel 本身调用 nccl 原语，不需要 CPU 中间层
+//
+// SymkKernelId 命名规则（为了理解这些 kernel）：
+//   AllReduce_AGxLL_R： AllGather(算法=LL协议)居然后做 Reduce(居然R）
+//   AllReduce_RSxLD_AGxST：RS(居然Load) + AG(居然Store) = 两阶段 AllReduce
+//   尾缀 MC = MultiCast（使用 NVLS 多播内存），比普通 LD/ST 更高效
+//   RailRing = 多节点坏速 Ring（每条 rail 内环形）
+//   LsaXxx = LSA（Local Symmetric Area）维度的操作（节点内）
+//   A2A = All-to-All布局的操作
+//
+// SymkDevComm： Kernel 登入后看到的最小上下文结构体，包含：
+//   - devComm：普通 ncclDevComm（rank/nRanks/channels等）
+//   - lsaLLA2A：节点内 LL A2A（Low Latency All-to-All）句柄
+//   - ginOutbox： GIN 出站缓冲运管句柄（流水线信用管理）
+//   - ginInboxRail： Rail 方向的 A2A 入站缓冲句柄
+//   - ginSyncHandle： GIN 同步句柄（信号/计数器）
+//
+// SymkState： Host 侧保存的 Symmetric kernel 全局状态。
+//   kcomm：和 kernel 共享的设备状态，在 ncclSymkInitOnce 时初始化
+//
+// SymkDevWork： 每次 symmetric collective 的工作元素（任务描述符）
+//   inputWin/outputWin： 对称内存窗口，指向跨节点对称内存
+//   sChannelId/nChannels：该工作使用的 channel 范围
+////////////////////////////////////////////////////////////////////////////////
 #define NCCL_SYM_KERNEL_CELL_SIZE 1024 // no less than 16 bytes minimal cell size
 
 constexpr int ncclSymkMaxBlocks = 64;
@@ -30,6 +63,17 @@ constexpr __host__ __device__ int ncclSymkLLMaxSlots(int eltSize = ncclSymkLLMax
   return ncclSymkMaxThreads*ncclSymkLLMaxEltSize/eltSize;
 }
 
+// ============================================================================
+// ncclSymkKernelId：Symmetric kernel 的种类标识符
+// 命名規则：{集体类型}_{算法简称}
+//   AG = AllGather,  RS = ReduceScatter
+//   LL = Low Latency 协议， ST = Store， LD = Load
+//   MC = MultiCast（使用 NVSwitch NVLS 多播）
+//   R  = Reduce
+//   RailRing = 每个节点内先内部融合，节点间再环形传输
+//   LsaSTMC = LSA（节点内）维度用 Store MultiCast
+//   RailA2A = Rail方向的 All-to-All
+// ============================================================================
 enum ncclSymkKernelId {
   ncclSymkKernelId_AllReduce_AGxLL_R,
   ncclSymkKernelId_AllReduce_AGxLLMC_R,
@@ -55,6 +99,10 @@ enum ncclSymkKernelId {
   ncclSymkKernelId_Count
 };
 
+// ============================================================================
+// ncclSymkDevComm： Symmetric Kernel 看到的设备上下文，包含所有 kernel 需要的句柄
+// 通过 ncclSymkDevWorkArgs 嵌入 kernel launch args 传入 kernel
+// ============================================================================
 struct ncclSymkDevComm {
   struct ncclDevComm devComm;
   struct ncclLLA2AHandle lsaLLA2A;
@@ -64,6 +112,13 @@ struct ncclSymkDevComm {
   struct ncclGinSyncHandle ginSyncHandle;
 };
 
+// ============================================================================
+// ncclSymkState：Host 侧为每个 comm 维护的 Symmetric kernel 全局状态
+// 存在于 comm->symkState，由 ncclSymkInitOnce() 初始化
+//   initialized：是否已调用 ncclSymkInitOnce()
+//   hasLsaMultimem：节点内是否支持 NVLS 多播（LSA 维度）
+//   kcomm：和 kernel 共享的设备状态，工作时嵌入 kernel 参数
+// ============================================================================
 struct ncclSymkState {
   bool initialized;
   bool hasLsaMultimem;
@@ -77,6 +132,13 @@ struct ncclSymkChannelWorkRange {
 };
 
 // 16 bytes aligned
+// ============================================================================
+// ncclSymkDevWork：每次 Symmetric collective 调用的工作元素
+//   16 字节对齐，嘉入 ncclSymkDevWorkArgs 后连续存储
+//   inputWin/outputWin：指向对称内存窗口（跨节点 VMM 映射）
+//   inputOff/outputOff：窗口内的偶同（包含 CBD分割偏移）
+//   nElts：本次工作处理的元素数
+// ============================================================================
 struct alignas(16) ncclSymkDevWork {
   uint64_t redOpArg; // must be collectively uniform
   size_t nElts;

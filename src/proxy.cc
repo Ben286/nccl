@@ -5,6 +5,56 @@
  * See LICENSE.txt for more license information
  *************************************************************************/
 
+
+// ============================================================================
+// proxy.cc — NCCL Proxy 线程系统
+// ============================================================================
+// Proxy 线程是 NCCL 网络传输的 CPU 处理中心。
+//
+// ===== 核心设计 =====
+//
+// 1. 每个 GPU 设备有一个或多个 Proxy Progress 线程（ncclProxyProgress）
+//    这些线程负责 IB Verbs 或其他网络传输的 CPU 侧进展
+//
+// 2. GPU kernel 完成后，host 侧通过 ncclProxyPost 将 op 入队到 proxyOpsPool
+//    Proxy 线程循环检查 pool，取出 op 并通过传输层执行
+//
+// 3. 为多个 send/recv 操作提供流水线进展：将多个 ncclProxyArgs 链接在一起
+//    progressOps() 循环调用每个 op 的 progress 回调
+//
+// ===== 关键数据结构 =====
+//
+//  ncclProxyOpsPool：共享内存池，host 和 proxy 线程共用的操作队列
+//    ops[]：MAX_OPS_PER_PEER * NCCL_MAX_LOCAL_RANKS 个 slot
+//    nextOps：已提交操作的链表头
+//    freeOps[peer]：每个 peer 的空闲 op slot 链表（lock-free CAS 管理）
+//    mutex/cond：线程等待/唤醒同步原语
+//
+//  ncclProxyArgs：一个活跃的 proxy 操作（各个 send 或 recv step 的集合）
+//    progress：函数指针，指向传输层的 ncclXxxSendProxy / ncclXxxRecvProxy
+//    state：ncclProxyOpNone，进行中，...
+//    next：链接同一 channel 的下一个 op（实现小尼古流水线）
+//
+//  ncclProxyProgressState：进展线程的内部状态
+//    active：当前活跃 op 链表头
+//    opsPool：指向共享池
+//
+// ===== 新增： runtimeConn 延迟连接 =====
+//   2.11 之前：init 时就建立所有传输连接
+//   新版本：comm->runtimeConn=true 时，传输连接延迟到首次使用时才建立
+//   ncclProxyStart 会检查并判断是否需要建立连接
+//
+// ===== 新增：UDS（Unix Domain Socket）通信 =====
+//   同一节点内不同进程的 rank 之间的 proxy 操作通过 UDS 传输
+//   ncclProxyCallBlockingUDS：啀 blocking 模式发送一个操作并等待响应
+//   ncclProxyClientGetFdBlocking：获取远端范围口的文件描述符（用于 CUDA IPC）
+//
+// ===== ncclProxyProgress 线程主循环 =====
+//   1. progressOps：推进所有 active op
+//   2. 每隔 ncclParamProgressAppendOpFreq 次循环，调用 ncclProxyGetPostedOps 拾取新 op
+//   3. 如果无工作则 yield，如果无操作则 cond.wait
+//   4. 循环直到 stop==1 且 active 为空
+// ============================================================================
 #include "comm.h"
 #include "info.h"
 #include "collectives.h"
@@ -761,6 +811,15 @@ static ncclResult_t removeOp(struct ncclProxyProgressState* state, struct ncclPr
   return ncclSuccess;
 }
 
+// progressOps：推进当前链表中所有 active 的传输操作
+// ============================================================================
+// 循环遍历 opStart 链表中的每个 op：
+//   调用 op->progress(proxyState, op)：传输层提供的进展函数
+//     例如：ncclIbSendProxy / ncclIbRecvProxy / ncclShmSendProxy 等
+//     这些函数负责：提交 WR 到 IB QP、轮询 CQ、更新 step 计数器 等
+//   op->idle：如果最近一次进展无工作则为真，控制是否 yield CPU
+//   op->state == ncclProxyOpNone：op 完成，从链表中移除
+// ============================================================================
 static ncclResult_t progressOps(struct ncclProxyState* proxyState, struct ncclProxyProgressState* state, struct ncclProxyArgs* opStart, int* idle) {
   struct ncclProxyArgs* prevOp = NULL;
   struct ncclProxyArgs* op = opStart;
@@ -940,6 +999,21 @@ fail:
   return;
 }
 
+// ncclProxyProgress：Proxy 线程主循环（每个 GPU 一个线程）
+// ============================================================================
+// 步骤：
+// 1. 设置 CUDA context（可选，需要 NCCL_CREATE_THREAD_CONTEXT=1）
+// 2. 设置调试信号 handler（NCCL_PROXY_DUMP_SIGNAL）
+// 3. 主循环：
+//    a. progressOps：推进所有 active op
+//    b. 如果空闲或达到频率阈值，调用 ncclProxyGetPostedOps 外取新 op
+//    c. 如果无新 op， std::this_thread::yield()
+//    d. 如果无 active op，等待 cond（就眠等外部唤醒）
+//
+// proxyOpAppendCounter：
+//   避免每轮都去检查新 op（小消息场景下开销较大）
+//   每隔 ncclParamProgressAppendOpFreq（默认 8）次循环才取一次
+// ============================================================================
 void* ncclProxyProgress(void *proxyState_) {
   struct ncclProxyState* proxyState = (struct ncclProxyState*)proxyState_;
   // This thread is created by proxyService, therefore setting the affinity is not needed.
